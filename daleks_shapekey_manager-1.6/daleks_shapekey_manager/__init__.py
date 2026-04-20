@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Dalek (https://dalek.coffee)
 
 """
-Dalek's Shapekey Manager - Blender 5.0 Add-on  v1.6
+Dalek's Shapekey Manager - Blender 5.0 Add-on  v1.7
 
 Shape keys whose names match ===ANYTHING=== are treated as category
 dividers. They are displayed as section headers, never selected, never
@@ -16,14 +16,13 @@ divider is detected, letting you filter the list to a single category.
 bl_info = {
     "name": "Dalek's Shapekey Manager",
     "author": "Generated for Blender 5.0",
-    "version": (1, 6, 0),
+    "version": (1, 7, 0),
     "blender": (5, 0, 0),
     "location": "Properties > Object Data > Shape Keys > Dalek's Shapekey Manager",
     "description": "Preview, filter, manage and audit large numbers of shape keys",
     "category": "Mesh",
 }
 
-import re
 import time
 import bpy
 from bpy.props import (
@@ -46,11 +45,18 @@ _DEFAULT_PATTERNS = [
 ]
 
 
+def _pattern_changed(self, context):
+    # Invalidate patterns cache and derived-data cache when a divider
+    # pattern is edited inline via the Configuration sub-panel.
+    _bump_prefs_version()
+
+
 class SKP_DividerPattern(bpy.types.PropertyGroup):
     token: StringProperty(
         name="Token",
         description="Surrounding token that marks a category divider (e.g. === wraps ===VRC===)",
         default="",
+        update=_pattern_changed,
     )
     level: EnumProperty(
         name="Level",
@@ -60,6 +66,7 @@ class SKP_DividerPattern(bpy.types.PropertyGroup):
             ('sub', "Sub", "Sub-level category header"),
         ],
         default='sub',
+        update=_pattern_changed,
     )
 
 
@@ -82,16 +89,70 @@ class SKP_AddonPreferences(bpy.types.AddonPreferences):
         pass  # drawn via the Configuration sub-panel in the main panel
 
 
+# -----------------------------------------
+#  Derived-data cache
+# -----------------------------------------
+#
+# Walking the shape_keys list and scanning divider tokens is the hot path for
+# this panel. With a few hundred shape keys and the naive design the draw
+# method was re-walking the list 4-7 times per redraw, and the category
+# EnumProperty callback was doing O(n * categories) counting work on every
+# draw. Both of those are invoked on every keystroke in the filter field and
+# on every tick of the preview slider.
+#
+# Instead we compute everything derived from the shape_keys list once, in
+# _rebuild_cache, and cache it in _MAP_CACHE keyed on
+#   (shape_keys.as_pointer(), len(key_blocks), _prefs_version).
+# - pointer change  -> active object / mesh changed
+# - length change   -> key added or removed by us or Blender
+# - prefs version   -> divider patterns edited in the Configuration sub-panel
+# All three checks are constant-time, so a cache hit costs only a dict
+# comparison. Renames without a length change are an accepted staleness
+# edge case - they only affect divider/label mapping and correct themselves
+# the next time the structure changes.
+
+_PATTERNS_CACHE = {'value': None, 'version': -1}
+_PREFS_VERSION = 0
+
+_MAP_CACHE = {
+    'sk_ptr': None,
+    'n_blocks': 0,
+    'prefs_version': -1,
+    'full_info': None,
+    'category_tree': None,
+    'categories': None,
+    'top_labels': None,
+    'real_key_entries': None,  # list[(index, name)] excluding dividers, in original order
+    'member_counts': None,     # {label -> real-key count}
+    'delete_counts': None,     # {label -> total entries Delete-Category would remove}
+    'has_categories': False,
+    'total_real': 0,
+}
+
+
+def _bump_prefs_version():
+    global _PREFS_VERSION
+    _PREFS_VERSION += 1
+
+
 def _get_patterns():
-    """Return list of (token, level) from preferences, falling back to defaults."""
+    """Cached list of (token, level) pairs from preferences."""
+    if (_PATTERNS_CACHE['value'] is not None
+            and _PATTERNS_CACHE['version'] == _PREFS_VERSION):
+        return _PATTERNS_CACHE['value']
     addon = bpy.context.preferences.addons.get(__name__)
+    patterns = None
     if addon:
         patterns = [(p.token.strip(), p.level)
                     for p in addon.preferences.divider_patterns
                     if p.token.strip()]
-        if patterns:
-            return patterns
-    return [(p['token'], p['level']) for p in _DEFAULT_PATTERNS]
+        if not patterns:
+            patterns = None
+    if patterns is None:
+        patterns = [(p['token'], p['level']) for p in _DEFAULT_PATTERNS]
+    _PATTERNS_CACHE['value'] = patterns
+    _PATTERNS_CACHE['version'] = _PREFS_VERSION
+    return patterns
 
 
 # -----------------------------------------
@@ -99,7 +160,7 @@ def _get_patterns():
 # -----------------------------------------
 
 def is_category_divider(name: str) -> bool:
-    for token, _ in _get_patterns():
+    for token, _level in _get_patterns():
         tlen = len(token)
         if (len(name) > tlen * 2
                 and name.startswith(token)
@@ -120,148 +181,138 @@ def divider_kind(name: str):
 
 
 def category_label(name: str) -> str:
-    """Extract inner label from either divider syntax, or return name unchanged."""
     _, label = divider_kind(name)
     return label
 
 
-def _build_full_map(obj):
-    """
-    Single-pass walk that returns:
-      info_map  : { kb.name -> {'kind': 'top'|'sub'|'key',
-                                'parent': str|None,   # label of enclosing top-level
-                                'sub':    str|None,   # label of enclosing sub-category
-                                'label':  str } }
-    Parent detection rule:
-      Two consecutive dividers (no real keys between them) means the first is a
-      parent header and the second starts the first child beneath it.
-    """
-    if not obj or not obj.data or not obj.data.shape_keys:
-        return {}
+def _rebuild_cache(obj):
+    """Recompute all derived views of the shape_keys list in a single pass."""
+    shape_keys = obj.data.shape_keys
+    blocks = shape_keys.key_blocks
+    # Pre-extract pattern tuples with precomputed token length to avoid
+    # len(token) on every key, and stop doing per-key attribute access.
+    patterns = [(token, level, len(token)) for token, level in _get_patterns()]
 
-    blocks = list(obj.data.shape_keys.key_blocks)
-    info = {}
+    full_info = {}
+    category_tree = []
+    categories = []
+    top_labels = set()
+    real_key_entries = []
+    member_counts = {}
+    delete_counts = {}
+    seen_tree = set()
+    seen_cat = set()
 
     current_top = ''
     current_sub = ''
-    prev_was_divider = False
 
-    for kb in blocks:
-        kind, label = divider_kind(kb.name)
+    for i, kb in enumerate(blocks):
+        name = kb.name
+        nlen = len(name)
+        kind = None
+        label = name
+        for token, lvl, tlen in patterns:
+            if nlen > tlen * 2 and name.startswith(token) and name.endswith(token):
+                kind = lvl
+                label = name[tlen:-tlen]
+                break
 
         if kind == 'top':
             current_top = label
             current_sub = ''
-            info[kb.name] = {'kind': 'top', 'parent': None, 'sub': None, 'label': label}
-            prev_was_divider = True
-
+            full_info[name] = {'kind': 'top', 'parent': None,
+                               'sub': None, 'label': label}
+            tkey = ('top', label)
+            if tkey not in seen_tree:
+                seen_tree.add(tkey)
+                category_tree.append({'label': label, 'kind': 'top', 'parent': None})
+            if label not in seen_cat:
+                seen_cat.add(label)
+                categories.append(label)
+            top_labels.add(label)
+            # The top divider itself contributes +1 to its own delete count
+            delete_counts[label] = delete_counts.get(label, 0) + 1
+            member_counts.setdefault(label, 0)
         elif kind == 'sub':
-            if prev_was_divider and current_sub == '':
-                # First sub right after another divider - this IS the first child group
-                pass
             current_sub = label
-            info[kb.name] = {'kind': 'sub', 'parent': current_top or None, 'sub': label, 'label': label}
-            prev_was_divider = True
-
+            parent = current_top or None
+            full_info[name] = {'kind': 'sub', 'parent': parent,
+                               'sub': label, 'label': label}
+            tkey = ('sub', label)
+            if tkey not in seen_tree:
+                seen_tree.add(tkey)
+                category_tree.append({'label': label, 'kind': 'sub', 'parent': parent})
+            if label not in seen_cat:
+                seen_cat.add(label)
+                categories.append(label)
+            # Sub divider itself counts once for its own deletion, and once
+            # toward the enclosing top's deletion (top-delete removes all
+            # sub dividers nested under it too).
+            delete_counts[label] = delete_counts.get(label, 0) + 1
+            if parent:
+                delete_counts[parent] = delete_counts.get(parent, 0) + 1
+            member_counts.setdefault(label, 0)
         else:
-            # Real shape key
-            info[kb.name] = {
-                'kind': 'key',
-                'parent': current_top or None,
-                'sub':    current_sub or None,
-                'label':  kb.name,
-            }
-            prev_was_divider = False
+            parent = current_top or None
+            sub = current_sub or None
+            full_info[name] = {'kind': 'key', 'parent': parent,
+                               'sub': sub, 'label': name}
+            real_key_entries.append((i, name))
+            if sub:
+                member_counts[sub] = member_counts.get(sub, 0) + 1
+                delete_counts[sub] = delete_counts.get(sub, 0) + 1
+            if parent:
+                member_counts[parent] = member_counts.get(parent, 0) + 1
+                delete_counts[parent] = delete_counts.get(parent, 0) + 1
 
-    return info
+    _MAP_CACHE.update({
+        'sk_ptr': shape_keys.as_pointer(),
+        'n_blocks': len(blocks),
+        'prefs_version': _PREFS_VERSION,
+        'full_info': full_info,
+        'category_tree': category_tree,
+        'categories': categories,
+        'top_labels': top_labels,
+        'real_key_entries': real_key_entries,
+        'member_counts': member_counts,
+        'delete_counts': delete_counts,
+        'has_categories': bool(categories),
+        'total_real': len(real_key_entries),
+    })
+    return _MAP_CACHE
 
 
-def assign_categories(obj) -> dict:
-    """
-    Return { key_name -> category_string } where category_string is the
-    most specific divider label above this key (sub beats top).
-    Divider entries themselves are excluded.
-    Keys before any divider map to ''.
-    """
-    info = _build_full_map(obj)
-    return {
-        name: (d['sub'] or d['parent'] or '')
-        for name, d in info.items()
-        if d['kind'] == 'key'
-    }
-
-
-def get_categories(obj) -> list:
-    """
-    Return an ordered list of unique category labels (both top and sub)
-    in the order they first appear. Returns [] if none exist.
-    """
+def _get_cache(obj):
+    """Return the derived-data cache for obj, rebuilding if stale. None if no shape keys."""
     if not obj or not obj.data or not obj.data.shape_keys:
-        return []
-    seen = []
-    for kb in obj.data.shape_keys.key_blocks:
-        if is_category_divider(kb.name):
-            label = category_label(kb.name)
-            if label not in seen:
-                seen.append(label)
-    return seen
-
-
-def get_category_tree(obj) -> list:
-    """
-    Return a structured list for building the enum / headers:
-      [ {'label': str, 'kind': 'top'|'sub', 'parent': str|None}, ... ]
-    in original order, deduplicated.
-    """
-    if not obj or not obj.data or not obj.data.shape_keys:
-        return []
-    info = _build_full_map(obj)
-    seen = set()
-    result = []
-    for kb in obj.data.shape_keys.key_blocks:
-        d = info.get(kb.name)
-        if d and d['kind'] in ('top', 'sub'):
-            key = (d['kind'], d['label'])
-            if key not in seen:
-                seen.add(key)
-                result.append({'label': d['label'], 'kind': d['kind'], 'parent': d['parent']})
-    return result
+        return None
+    shape_keys = obj.data.shape_keys
+    sk_ptr = shape_keys.as_pointer()
+    n = len(shape_keys.key_blocks)
+    if (_MAP_CACHE['sk_ptr'] == sk_ptr
+            and _MAP_CACHE['n_blocks'] == n
+            and _MAP_CACHE['prefs_version'] == _PREFS_VERSION
+            and _MAP_CACHE['full_info'] is not None):
+        return _MAP_CACHE
+    return _rebuild_cache(obj)
 
 
 def build_category_enum(self, context):
-    """
-    Dynamic EnumProperty items callback.
-    ALL first, then top-level categories, then sub-categories indented under their parent.
-    Each label is suffixed with the count of real shape keys it contains.
-    """
+    """EnumProperty items callback - fires on every panel redraw."""
     obj = context.active_object if context else None
-    if not obj or not obj.data or not obj.data.shape_keys:
+    cache = _get_cache(obj)
+    if cache is None:
         return [('ALL', "All Categories", "Show all shape keys")]
 
-    full_info = _build_full_map(obj)
-    blocks = obj.data.shape_keys.key_blocks
-
-    # Count all real keys (non-divider). Basis is included to match the Total stat.
-    total = sum(1 for kb in blocks if not is_category_divider(kb.name))
-
+    total = cache['total_real']
     items = [('ALL', f"All Categories ({total})", "Show all shape keys")]
-
-    tree = get_category_tree(obj)
-    for entry in tree:
+    member_counts = cache['member_counts']
+    for entry in cache['category_tree']:
         label = entry['label']
+        count = member_counts.get(label, 0)
         if entry['kind'] == 'top':
-            count = sum(
-                1 for kb in blocks
-                if full_info.get(kb.name, {}).get('kind') == 'key'
-                and full_info.get(kb.name, {}).get('parent') == label
-            )
             items.append((label, f"{label} ({count})", f"Top-level category: {label}"))
         else:
-            count = sum(
-                1 for kb in blocks
-                if full_info.get(kb.name, {}).get('kind') == 'key'
-                and full_info.get(kb.name, {}).get('sub') == label
-            )
             items.append((label, f"  {label} ({count})", f"Sub-category: {label}"))
     return items
 
@@ -382,43 +433,28 @@ def get_filtered_keys(obj, props):
     Category divider entries are NEVER included - they only affect the
     category mapping used by the category_filter.
     """
-    if not obj or not obj.data or not obj.data.shape_keys:
+    cache = _get_cache(obj)
+    if cache is None:
         return []
 
-    # Build category map once
-    cat_map = assign_categories(obj)
+    blocks = obj.data.shape_keys.key_blocks
+    show_basis = props.show_basis
 
-    keys = []
-    for i, kb in enumerate(obj.data.shape_keys.key_blocks):
-        # Skip category dividers entirely
-        if is_category_divider(kb.name):
-            continue
-        # Skip Basis unless requested
-        if kb.name == "Basis" and not props.show_basis:
-            continue
-        keys.append((i, kb))
+    # real_key_entries is pre-filtered to exclude dividers (built once per
+    # structural change in _rebuild_cache), so no per-key divider test here.
+    if show_basis:
+        keys = [(i, blocks[i]) for i, _name in cache['real_key_entries']]
+    else:
+        keys = [(i, blocks[i]) for i, name in cache['real_key_entries']
+                if name != "Basis"]
 
     # Category filter (only when categories exist)
     cat_filter = props.category_filter
     if cat_filter and cat_filter != 'ALL':
-        full_info = _build_full_map(obj)
-        tree = get_category_tree(obj)
-        top_labels = {e["label"] for e in tree if e["kind"] == "top"}
-        is_top = cat_filter in top_labels
-
-        if is_top:
-            # Top-level selected: include all keys whose parent matches,
-            # regardless of which sub-category they belong to
-            def _matches(kb_name):
-                d = full_info.get(kb_name, {})
-                return d.get("parent") == cat_filter
-        else:
-            # Sub-category selected: exact sub match only, never parent match
-            def _matches(kb_name):
-                d = full_info.get(kb_name, {})
-                return d.get("sub") == cat_filter
-
-        keys = [(i, kb) for i, kb in keys if _matches(kb.name)]
+        full_info = cache['full_info']
+        parent_key = 'parent' if cat_filter in cache['top_labels'] else 'sub'
+        keys = [(i, kb) for i, kb in keys
+                if full_info.get(kb.name, {}).get(parent_key) == cat_filter]
 
     # Text search
     query = props.search_filter.strip().lower()
@@ -437,45 +473,6 @@ def get_filtered_keys(obj, props):
         keys.sort(key=lambda x: (0 if x[1].value > 0 else 1, x[0]))
 
     return keys
-
-
-def get_display_items(obj, props):
-    """
-    Return a list of display items for the current page.
-    Each item is one of:
-      ('KEY',      original_index, shape_key, filtered_list_position)
-      ('CATEGORY', None,           label_str, None)
-
-    Category header rows are injected when sort_mode is NONE and
-    category_filter is ALL, so the user sees the natural grouped layout.
-    In any other sort mode or when filtered to a single category, headers
-    are omitted (the category column in the row is enough context).
-    """
-    filtered = get_filtered_keys(obj, props)
-
-    # Inject category headers only in default order + all-categories view
-    inject_headers = (
-        props.sort_mode == 'NONE'
-        and props.category_filter == 'ALL'
-        and bool(get_categories(obj))
-    )
-
-    if not inject_headers:
-        return filtered, filtered  # (display_items, step_pool)
-
-    cat_map = assign_categories(obj)
-    display = []
-    last_cat = object()  # sentinel
-
-    for item in filtered:
-        _, kb = item
-        cat = cat_map.get(kb.name, '')
-        if cat != last_cat:
-            display.append(('CATEGORY', cat))
-            last_cat = cat
-        display.append(('KEY', item))
-
-    return display, filtered
 
 
 def total_pages(filtered, page_size):
@@ -526,9 +523,8 @@ def _apply_step(context, delta):
     new_fi = max(0, min(len(filtered) - 1, current + delta))
     props.step_index = new_fi
 
-    _, kb = filtered[new_fi]
-    blocks = obj.data.shape_keys.key_blocks
-    obj.active_shape_key_index = list(blocks.keys()).index(kb.name)
+    orig_idx, kb = filtered[new_fi]
+    obj.active_shape_key_index = orig_idx
 
     if props.auto_preview:
         bpy.ops.skp.preview_key(key_name=kb.name)
@@ -582,9 +578,10 @@ class SKP_OT_PreviewKey(Operator):
                 if kb.name != "Basis" and not is_category_divider(kb.name):
                     kb.value = 0.0
 
-        if self.key_name in blocks:
-            blocks[self.key_name].value = props.preview_value
-            obj.active_shape_key_index = list(blocks.keys()).index(self.key_name)
+        idx = blocks.find(self.key_name)
+        if idx >= 0:
+            blocks[idx].value = props.preview_value
+            obj.active_shape_key_index = idx
         else:
             self.report({'WARNING'}, f"Shape key '{self.key_name}' not found.")
             return {'CANCELLED'}
@@ -631,12 +628,13 @@ class SKP_OT_ApplyKey(Operator):
             return {'CANCELLED'}
 
         blocks = obj.data.shape_keys.key_blocks
-        if self.key_name not in blocks:
+        idx = blocks.find(self.key_name)
+        if idx < 0:
             self.report({'WARNING'}, f"Shape key '{self.key_name}' not found.")
             return {'CANCELLED'}
 
         # Set as active then use Blender's built-in apply
-        obj.active_shape_key_index = list(blocks.keys()).index(self.key_name)
+        obj.active_shape_key_index = idx
         bpy.ops.object.shape_key_remove(all=False, apply_mix=True)
         self.report({'INFO'}, f"Applied shape key: {self.key_name}")
         return {'FINISHED'}
@@ -665,11 +663,12 @@ class SKP_OT_DeleteKey(Operator):
             return {'CANCELLED'}
 
         blocks = obj.data.shape_keys.key_blocks
-        if self.key_name not in blocks:
+        idx = blocks.find(self.key_name)
+        if idx < 0:
             self.report({'WARNING'}, f"Shape key '{self.key_name}' not found.")
             return {'CANCELLED'}
 
-        obj.active_shape_key_index = list(blocks.keys()).index(self.key_name)
+        obj.active_shape_key_index = idx
         bpy.ops.object.shape_key_remove(all=False, apply_mix=False)
         self.report({'INFO'}, f"Deleted shape key: {self.key_name}")
         return {'FINISHED'}
@@ -771,35 +770,23 @@ class SKP_OT_DeleteCategory(Operator):
 
     def _collect_keys(self, context):
         obj = context.active_object
-        if not obj or not obj.data or not obj.data.shape_keys:
+        cache = _get_cache(obj)
+        if cache is None:
             return []
-        blocks = obj.data.shape_keys.key_blocks
-        full_info = _build_full_map(obj)
-        tree = get_category_tree(obj)
-        top_labels = {e["label"] for e in tree if e["kind"] == "top"}
-        is_top = self.category_name in top_labels
+        cat = self.category_name
+        is_top = cat in cache['top_labels']
 
         result = []
-        for kb in blocks:
-            d = full_info.get(kb.name, {})
-            kind = d.get("kind")
+        for name, d in cache['full_info'].items():
+            kind = d['kind']
             if is_top:
-                # The top divider itself
-                if kind == "top" and d.get("label") == self.category_name:
-                    result.append(kb.name)
-                # All sub-dividers that belong under this top category
-                elif kind == "sub" and d.get("parent") == self.category_name:
-                    result.append(kb.name)
-                # All member keys under this top category
-                elif kind == "key" and d.get("parent") == self.category_name:
-                    result.append(kb.name)
+                if ((kind == 'top' and d['label'] == cat)
+                        or (kind in ('sub', 'key') and d['parent'] == cat)):
+                    result.append(name)
             else:
-                # The sub divider itself
-                if kind == "sub" and d.get("label") == self.category_name:
-                    result.append(kb.name)
-                # Member keys directly in this sub-category
-                elif kind == "key" and d.get("sub") == self.category_name:
-                    result.append(kb.name)
+                if ((kind == 'sub' and d['label'] == cat)
+                        or (kind == 'key' and d['sub'] == cat)):
+                    result.append(name)
         return result
 
     def _seconds_remaining(self):
@@ -824,9 +811,10 @@ class SKP_OT_DeleteCategory(Operator):
         # because the live blocks list shrinks as keys are removed.
         for name in to_delete:
             blocks = obj.data.shape_keys.key_blocks
-            if name not in blocks:
+            idx = blocks.find(name)
+            if idx < 0:
                 continue
-            obj.active_shape_key_index = list(blocks.keys()).index(name)
+            obj.active_shape_key_index = idx
             bpy.ops.object.shape_key_remove(all=False, apply_mix=False)
 
         self.report({'INFO'}, f"Deleted category '{self.category_name}' ({len(to_delete)} keys).")
@@ -951,13 +939,13 @@ class SKP_OT_DeleteEmptyKeys(Operator):
 
     def _collect_empty_keys(self, context):
         obj = context.active_object
-        if not obj or not obj.data or not obj.data.shape_keys:
+        cache = _get_cache(obj)
+        if cache is None:
             return []
-        return [
-            kb.name
-            for kb in obj.data.shape_keys.key_blocks
-            if not is_category_divider(kb.name) and _is_key_empty(obj, kb)
-        ]
+        blocks = obj.data.shape_keys.key_blocks
+        # real_key_entries already excludes dividers
+        return [name for i, name in cache['real_key_entries']
+                if _is_key_empty(obj, blocks[i])]
 
     def _seconds_remaining(self):
         elapsed = time.time() - SKP_OT_DeleteEmptyKeys._start_time
@@ -979,9 +967,10 @@ class SKP_OT_DeleteEmptyKeys(Operator):
 
         for name in to_delete:
             blocks = obj.data.shape_keys.key_blocks
-            if name not in blocks:
+            idx = blocks.find(name)
+            if idx < 0:
                 continue
-            obj.active_shape_key_index = list(blocks.keys()).index(name)
+            obj.active_shape_key_index = idx
             bpy.ops.object.shape_key_remove(all=False, apply_mix=False)
 
         self.report({'INFO'}, f"Deleted {len(to_delete)} empty shape key(s).")
@@ -1148,13 +1137,13 @@ class SKP_OT_SelectAndPreview(Operator):
             return {'CANCELLED'}
 
         blocks = obj.data.shape_keys.key_blocks
-        if self.key_name not in blocks:
+        target_idx = blocks.find(self.key_name)
+        if target_idx < 0:
             return {'CANCELLED'}
 
         current_idx = obj.active_shape_key_index
-        target_idx = list(blocks.keys()).index(self.key_name)
         already_active = (current_idx == target_idx)
-        kb = blocks[self.key_name]
+        kb = blocks[target_idx]
 
         if self.extend:
             # Shift-click: toggle this key only, leaving every other key untouched.
@@ -1175,8 +1164,8 @@ class SKP_OT_SelectAndPreview(Operator):
         if already_active:
             # Deselect: zero this key's value and move active back to Basis
             kb.value = 0.0
-            basis_idx = list(blocks.keys()).index('Basis') if 'Basis' in blocks else 0
-            obj.active_shape_key_index = basis_idx
+            basis_idx = blocks.find('Basis')
+            obj.active_shape_key_index = basis_idx if basis_idx >= 0 else 0
             props.step_index = -1
         else:
             # Select normally
@@ -1296,19 +1285,20 @@ class SKP_PT_MainPanel(Panel):
         obj = context.active_object
         props = context.scene.skp_props
 
-        categories = get_categories(obj)
-        has_categories = bool(categories)
+        # Single cache fetch covers every derived view we need below
+        # (categories, full_info, tree, top_labels, member/delete counts,
+        # total real-key count). poll() guarantees shape_keys exists.
+        cache = _get_cache(obj)
+        has_categories = cache['has_categories']
+        categories = cache['categories']
+        total_real = cache['total_real']
 
-        # Stats
-        total_all = len(obj.data.shape_keys.key_blocks)
-        # Subtract category divider entries from the "total" count shown
-        total_dividers = sum(1 for kb in obj.data.shape_keys.key_blocks if is_category_divider(kb.name))
         filtered = get_filtered_keys(obj, props)
         total_filtered = len(filtered)
 
         row = layout.row()
         row.label(
-            text=f"Total: {total_all - total_dividers}  |  Shown: {total_filtered}"
+            text=f"Total: {total_real}  |  Shown: {total_filtered}"
                  + (f"  |  Categories: {len(categories)}" if has_categories else ""),
             icon='SHAPEKEY_DATA',
         )
@@ -1385,34 +1375,8 @@ class SKP_PT_MainPanel(Panel):
             del_cat_row = box.row(align=True)
             del_cat_row.enabled = is_specific_cat
             if is_specific_cat:
-                # Count exactly what will be deleted using the same logic as the operator
-                full_info_del = _build_full_map(obj)
-                tree_del = get_category_tree(obj)
-                top_labels_del = {e["label"] for e in tree_del if e["kind"] == "top"}
-                is_top_cat = active_cat in top_labels_del
-
-                if is_top_cat:
-                    # Top-level: count all keys whose parent matches + all sub-dividers + the top divider
-                    n_members = sum(
-                        1 for kb in obj.data.shape_keys.key_blocks
-                        if full_info_del.get(kb.name, {}).get("parent") == active_cat
-                        and full_info_del.get(kb.name, {}).get("kind") == "key"
-                    )
-                    n_subdividers = sum(
-                        1 for kb in obj.data.shape_keys.key_blocks
-                        if full_info_del.get(kb.name, {}).get("kind") == "sub"
-                        and full_info_del.get(kb.name, {}).get("parent") == active_cat
-                    )
-                    n_total = n_members + n_subdividers + 1  # +1 for the top divider
-                else:
-                    # Sub-category: only keys in this sub + its own divider
-                    n_members = sum(
-                        1 for kb in obj.data.shape_keys.key_blocks
-                        if full_info_del.get(kb.name, {}).get("sub") == active_cat
-                        and full_info_del.get(kb.name, {}).get("kind") == "key"
-                    )
-                    n_total = n_members + 1  # +1 for the sub divider
-
+                # Count pre-computed in _rebuild_cache - no extra scan.
+                n_total = cache['delete_counts'].get(active_cat, 0)
                 del_op = del_cat_row.operator(
                     "skp.delete_category",
                     text=f"Delete Category ({n_total})",
@@ -1459,9 +1423,7 @@ class SKP_PT_MainPanel(Panel):
             #   - A top-level category is selected (show sub headers within it)
             # Not when a sub-category is selected (single flat group, no headers needed)
             cat_filter = props.category_filter
-            tree = get_category_tree(obj)
-            top_labels = {e['label'] for e in tree if e['kind'] == 'top'}
-            viewing_top = cat_filter in top_labels  # parent selected
+            viewing_top = cat_filter in cache['top_labels']
             viewing_all = cat_filter == 'ALL'
 
             inject_headers = (
@@ -1470,7 +1432,7 @@ class SKP_PT_MainPanel(Panel):
                 and has_categories
             )
 
-            full_info = _build_full_map(obj) if inject_headers else {}
+            full_info = cache['full_info'] if inject_headers else {}
             last_shown_top = object()   # sentinels
             last_shown_sub = object()
 
@@ -1572,6 +1534,7 @@ class SKP_OT_AddDividerPattern(Operator):
         item.token = "***"
         item.level = 'sub'
         prefs.divider_patterns_index = len(prefs.divider_patterns) - 1
+        _bump_prefs_version()
         return {'FINISHED'}
 
 
@@ -1587,6 +1550,7 @@ class SKP_OT_RemoveDividerPattern(Operator):
         if 0 <= self.index < len(prefs.divider_patterns):
             prefs.divider_patterns.remove(self.index)
             prefs.divider_patterns_index = max(0, self.index - 1)
+            _bump_prefs_version()
         return {'FINISHED'}
 
 
@@ -1603,6 +1567,7 @@ class SKP_OT_ResetDividerPatterns(Operator):
             item.token = p['token']
             item.level = p['level']
         prefs.divider_patterns_index = 0
+        _bump_prefs_version()
         self.report({'INFO'}, "Divider patterns reset to defaults.")
         return {'FINISHED'}
 
