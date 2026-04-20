@@ -301,7 +301,7 @@ class SKP_Properties(PropertyGroup):
     auto_preview: BoolProperty(
         name="Auto Preview on Select",
         description="Automatically preview a shape key when selected in the list",
-        default=False,
+        default=True,
     )
 
     page_size: IntProperty(

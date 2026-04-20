@@ -19,7 +19,7 @@ Shape keys named with surrounding tokens (like `===Face===` or `---Brows---`) ar
 
 - Drag the **Preview Value** slider to apply a shape key to the mesh in real time, no operator required
 - **Auto Reset Others** zeros out all other shape keys before previewing so you see each key in isolation
-- **Auto Preview on Select** automatically triggers a preview whenever you click a key in the list
+- **Auto Preview on Select** automatically triggers a preview whenever you click a key in the list (enabled by default)
 - **Reset All to 0** resets every shape key at once with one click
 
 ### Step Navigation
