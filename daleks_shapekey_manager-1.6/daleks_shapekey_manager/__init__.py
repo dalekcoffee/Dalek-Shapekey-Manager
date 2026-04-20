@@ -752,6 +752,12 @@ class SKP_OT_DeleteCategory(Operator):
 
     category_name: StringProperty()
     key_count: IntProperty()
+    respect_filter: BoolProperty(
+        name="Respect Filter",
+        description="If true, only collect keys within this category that match the active search filter",
+        default=False,
+        options={'SKIP_SAVE'},
+    )
     show_keys_toggle: BoolProperty(
         name="Show Keys",
         default=False,
@@ -787,6 +793,15 @@ class SKP_OT_DeleteCategory(Operator):
                 if ((kind == 'sub' and d['label'] == cat)
                         or (kind == 'key' and d['sub'] == cat)):
                     result.append(name)
+
+        if self.respect_filter:
+            query = context.scene.skp_props.search_filter.strip().lower()
+            if query:
+                # Divider names rarely match a user filter; excluding them
+                # when filter is active matches the user's mental model of
+                # "delete just the visible matches, leave the category intact."
+                result = [n for n in result if query in n.lower()]
+
         return result
 
     def _seconds_remaining(self):
@@ -849,12 +864,27 @@ class SKP_OT_DeleteCategory(Operator):
         # Warning header
         col = layout.column()
         col.alert = True
-        col.label(text=f"Delete entire category: {self.category_name}", icon='ERROR')
+        if self.respect_filter:
+            col.label(
+                text=f"Delete filtered keys in: {self.category_name}",
+                icon='ERROR',
+            )
+        else:
+            col.label(
+                text=f"Delete entire category: {self.category_name}",
+                icon='ERROR',
+            )
         col.alert = False
 
         layout.separator(factor=0.3)
-        layout.label(text=f"This will permanently delete {self.key_count} shape key(s),")
-        layout.label(text="including the category divider. This cannot be undone easily.")
+        layout.label(text=f"This will permanently delete {self.key_count} shape key(s).")
+        if self.respect_filter:
+            query = context.scene.skp_props.search_filter.strip()
+            if query:
+                layout.label(text=f'Only keys matching filter "{query}" will be removed.')
+            layout.label(text="The category divider will be kept. This cannot be undone easily.")
+        else:
+            layout.label(text="Includes the category divider. This cannot be undone easily.")
 
         layout.separator(factor=0.5)
 
@@ -1010,6 +1040,139 @@ class SKP_OT_DeleteEmptyKeys(Operator):
         layout.separator(factor=0.3)
         layout.label(text="These keys have no vertex displacement from Basis.")
         layout.label(text="They will be permanently removed. This cannot be undone easily.")
+
+        layout.separator(factor=0.5)
+
+        toggle_icon = 'TRIA_DOWN' if self.show_keys_toggle else 'TRIA_RIGHT'
+        toggle_text = (
+            f"Hide keys to be deleted ({self.key_count})"
+            if self.show_keys_toggle else
+            f"Show keys to be deleted ({self.key_count})"
+        )
+        layout.prop(self, "show_keys_toggle", text=toggle_text, toggle=True, icon=toggle_icon)
+
+        if self.show_keys_toggle:
+            row = layout.row(align=True)
+            row.prop(context.scene, "skp_delete_filter", text="", icon='VIEWZOOM',
+                     placeholder="Filter keys...")
+            if context.scene.skp_delete_filter:
+                row.operator("skp.delete_filter_clear", text="", icon='X')
+
+            rows = max(5, min(30, self.key_count))
+            layout.template_list(
+                "SKP_UL_delete_preview", "",
+                context.scene, "skp_delete_preview",
+                context.scene, "skp_delete_preview_index",
+                rows=rows,
+            )
+
+        layout.separator(factor=0.5)
+
+        if remaining > 0:
+            secs = int(remaining) + 1
+            warn_row = layout.row()
+            warn_row.alert = True
+            warn_row.label(text=f"OK available in {secs}s - read the warning above", icon='TIME')
+        else:
+            layout.label(text="Cooldown complete. Click OK to confirm.", icon='CHECKMARK')
+
+
+class SKP_OT_DeleteFiltered(Operator):
+    """Delete every shape key currently matching the text filter
+    (across all categories in the active category scope).
+    Opens the same timed confirmation dialog as Delete Category."""
+    bl_idname = "skp.delete_filtered"
+    bl_label = "Delete Filtered Keys"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    key_count: IntProperty()
+    show_keys_toggle: BoolProperty(name="Show Keys", default=False)
+
+    _start_time: float = 0.0
+    _keys_to_delete: list = []
+
+    @staticmethod
+    def _cooldown():
+        addon = bpy.context.preferences.addons.get(__name__)
+        if addon:
+            return addon.preferences.delete_cooldown
+        return 5.0
+
+    def _collect_filtered_keys(self, context):
+        obj = context.active_object
+        props = context.scene.skp_props
+        # get_filtered_keys already excludes dividers
+        return [kb.name for _i, kb in get_filtered_keys(obj, props)]
+
+    def _seconds_remaining(self):
+        elapsed = time.time() - SKP_OT_DeleteFiltered._start_time
+        return max(0.0, self._cooldown() - elapsed)
+
+    def execute(self, context):
+        if self._seconds_remaining() > 0:
+            self.report({'WARNING'}, "Please wait for the cooldown before confirming.")
+            return {'CANCELLED'}
+
+        obj = context.active_object
+        if not obj or not obj.data or not obj.data.shape_keys:
+            return {'CANCELLED'}
+
+        to_delete = SKP_OT_DeleteFiltered._keys_to_delete
+        if not to_delete:
+            self.report({'INFO'}, "No keys matching the current filter.")
+            return {'CANCELLED'}
+
+        for name in to_delete:
+            blocks = obj.data.shape_keys.key_blocks
+            idx = blocks.find(name)
+            if idx < 0:
+                continue
+            obj.active_shape_key_index = idx
+            bpy.ops.object.shape_key_remove(all=False, apply_mix=False)
+
+        self.report({'INFO'}, f"Deleted {len(to_delete)} filtered shape key(s).")
+        SKP_OT_DeleteFiltered._keys_to_delete = []
+        context.scene.skp_delete_preview.clear()
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        SKP_OT_DeleteFiltered._start_time = time.time()
+        SKP_OT_DeleteFiltered._keys_to_delete = self._collect_filtered_keys(context)
+        self.key_count = len(SKP_OT_DeleteFiltered._keys_to_delete)
+
+        if self.key_count == 0:
+            self.report({'INFO'}, "No keys matching the current filter.")
+            return {'CANCELLED'}
+
+        col = context.scene.skp_delete_preview
+        col.clear()
+        for name in SKP_OT_DeleteFiltered._keys_to_delete:
+            item = col.add()
+            item.name = name
+            item.is_divider = False
+
+        context.scene.skp_delete_preview_index = 0
+        context.scene.skp_delete_filter = ""
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        layout = self.layout
+        remaining = self._seconds_remaining()
+        props = context.scene.skp_props
+
+        col = layout.column()
+        col.alert = True
+        col.label(text=f"Delete {self.key_count} filtered shape key(s)", icon='ERROR')
+        col.alert = False
+
+        layout.separator(factor=0.3)
+        query = props.search_filter.strip()
+        if query:
+            layout.label(text=f'Matching filter: "{query}"')
+        active_cat = props.category_filter
+        if active_cat and active_cat != 'ALL':
+            layout.label(text=f"Within category: {active_cat}")
+        layout.label(text="These keys will be permanently removed. This cannot be undone easily.")
 
         layout.separator(factor=0.5)
 
@@ -1384,12 +1547,32 @@ class SKP_PT_MainPanel(Panel):
                 )
                 del_op.category_name = active_cat
                 del_op.key_count = n_total
+                del_op.respect_filter = False
             else:
                 del_cat_row.operator(
                     "skp.delete_category",
                     text="Delete Category",
                     icon='TRASH',
                 )
+
+        # Delete-Filtered button - only active when a text filter is present,
+        # to prevent a misclick wiping out every visible key.
+        has_query = bool(props.search_filter.strip())
+        del_filt_row = box.row(align=True)
+        del_filt_row.enabled = has_query
+        if has_query:
+            del_filt_op = del_filt_row.operator(
+                "skp.delete_filtered",
+                text=f"Delete Filtered ({total_filtered})",
+                icon='TRASH',
+            )
+            del_filt_op.key_count = total_filtered
+        else:
+            del_filt_row.operator(
+                "skp.delete_filtered",
+                text="Delete Filtered",
+                icon='TRASH',
+            )
 
         # Pagination (based on the filtered key count, not display items with headers)
         num_pages = total_pages(filtered, props.page_size)
@@ -1449,8 +1632,16 @@ class SKP_PT_MainPanel(Panel):
                         last_shown_sub = object()  # reset sub sentinel
                         if this_top:
                             top_row = col.row()
-                            top_row.enabled = False
-                            top_row.label(text=this_top, icon='OUTLINER_COLLECTION')
+                            lbl = top_row.row()
+                            lbl.enabled = False
+                            lbl.label(text=this_top, icon='OUTLINER_COLLECTION')
+                            btn = top_row.row(align=True)
+                            btn.alignment = 'RIGHT'
+                            top_del = btn.operator(
+                                "skp.delete_category", text="", icon='TRASH',
+                            )
+                            top_del.category_name = this_top
+                            top_del.respect_filter = True
                         elif not this_top and not this_sub:
                             top_row = col.row()
                             top_row.enabled = False
@@ -1460,9 +1651,17 @@ class SKP_PT_MainPanel(Panel):
                     if this_sub and this_sub != last_shown_sub:
                         last_shown_sub = this_sub
                         sub_row = col.row()
-                        sub_row.enabled = False
+                        lbl = sub_row.row()
+                        lbl.enabled = False
                         indent = "    " if viewing_all else "  "
-                        sub_row.label(text=f"{indent}{this_sub}", icon='DOT')
+                        lbl.label(text=f"{indent}{this_sub}", icon='DOT')
+                        btn = sub_row.row(align=True)
+                        btn.alignment = 'RIGHT'
+                        sub_del = btn.operator(
+                            "skp.delete_category", text="", icon='TRASH',
+                        )
+                        sub_del.category_name = this_sub
+                        sub_del.respect_filter = True
 
                 is_active = (idx == active_idx)
                 has_value = kb.value > 0.0
@@ -1637,6 +1836,7 @@ CLASSES = [
     SKP_OT_DeleteCategory,
     SKP_OT_DeleteFilterClear,
     SKP_OT_DeleteEmptyKeys,
+    SKP_OT_DeleteFiltered,
     SKP_OT_PageNext,
     SKP_OT_PagePrev,
     SKP_OT_PageFirst,
