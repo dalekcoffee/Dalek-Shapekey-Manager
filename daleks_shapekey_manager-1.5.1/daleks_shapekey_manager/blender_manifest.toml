@@ -1,0 +1,18 @@
+schema_version = "1.0.0"
+
+id = "daleks_shapekey_manager"
+version = "1.5.1"
+name = "Dalek's Shapekey Manager"
+tagline = "Preview, filter, manage and audit large numbers of shape keys"
+maintainer = "Dalek <https://dalek.coffee>"
+type = "add-on"
+
+website = "https://dalek.coffee"
+
+tags = ["Mesh"]
+
+blender_version_min = "5.0.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+copyright = ["2025 Dalek (https://dalek.coffee)"]
