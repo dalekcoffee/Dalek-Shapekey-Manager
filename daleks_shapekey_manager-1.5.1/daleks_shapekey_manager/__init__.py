@@ -886,6 +886,146 @@ class SKP_OT_DeleteFilterClear(Operator):
         return {'FINISHED'}
 
 
+def _is_key_empty(obj, kb):
+    """Return True if every vertex in this shape key matches the reference key (Basis)."""
+    ref = obj.data.shape_keys.reference_key
+    if kb.name == ref.name:
+        return False
+    for v_sk, v_ref in zip(kb.data, ref.data):
+        if (v_sk.co - v_ref.co).length_squared > 1e-10:
+            return False
+    return True
+
+
+class SKP_OT_DeleteEmptyKeys(Operator):
+    """Delete all shape keys that have no vertex displacement from the Basis.
+    Opens the same timed confirmation dialog as Delete Category."""
+    bl_idname = "skp.delete_empty_keys"
+    bl_label = "Delete Empty Blendshapes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    key_count: IntProperty()
+    show_keys_toggle: BoolProperty(name="Show Keys", default=False)
+
+    _start_time: float = 0.0
+    _keys_to_delete: list = []
+
+    @staticmethod
+    def _cooldown():
+        addon = bpy.context.preferences.addons.get(__name__)
+        if addon:
+            return addon.preferences.delete_cooldown
+        return 5.0
+
+    def _collect_empty_keys(self, context):
+        obj = context.active_object
+        if not obj or not obj.data or not obj.data.shape_keys:
+            return []
+        return [
+            kb.name
+            for kb in obj.data.shape_keys.key_blocks
+            if not is_category_divider(kb.name) and _is_key_empty(obj, kb)
+        ]
+
+    def _seconds_remaining(self):
+        elapsed = time.time() - SKP_OT_DeleteEmptyKeys._start_time
+        return max(0.0, self._cooldown() - elapsed)
+
+    def execute(self, context):
+        if self._seconds_remaining() > 0:
+            self.report({'WARNING'}, "Please wait for the cooldown before confirming.")
+            return {'CANCELLED'}
+
+        obj = context.active_object
+        if not obj or not obj.data or not obj.data.shape_keys:
+            return {'CANCELLED'}
+
+        to_delete = SKP_OT_DeleteEmptyKeys._keys_to_delete
+        if not to_delete:
+            self.report({'INFO'}, "No empty shape keys found.")
+            return {'CANCELLED'}
+
+        for name in to_delete:
+            blocks = obj.data.shape_keys.key_blocks
+            if name not in blocks:
+                continue
+            obj.active_shape_key_index = list(blocks.keys()).index(name)
+            bpy.ops.object.shape_key_remove(all=False, apply_mix=False)
+
+        self.report({'INFO'}, f"Deleted {len(to_delete)} empty shape key(s).")
+        SKP_OT_DeleteEmptyKeys._keys_to_delete = []
+        context.scene.skp_delete_preview.clear()
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        SKP_OT_DeleteEmptyKeys._start_time = time.time()
+        SKP_OT_DeleteEmptyKeys._keys_to_delete = self._collect_empty_keys(context)
+        self.key_count = len(SKP_OT_DeleteEmptyKeys._keys_to_delete)
+
+        if self.key_count == 0:
+            self.report({'INFO'}, "No empty shape keys found.")
+            return {'CANCELLED'}
+
+        col = context.scene.skp_delete_preview
+        col.clear()
+        for name in SKP_OT_DeleteEmptyKeys._keys_to_delete:
+            item = col.add()
+            item.name = name
+            item.is_divider = False
+
+        context.scene.skp_delete_preview_index = 0
+        context.scene.skp_delete_filter = ""
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        layout = self.layout
+        remaining = self._seconds_remaining()
+
+        col = layout.column()
+        col.alert = True
+        col.label(text=f"Delete {self.key_count} empty shape key(s)", icon='ERROR')
+        col.alert = False
+
+        layout.separator(factor=0.3)
+        layout.label(text="These keys have no vertex displacement from Basis.")
+        layout.label(text="They will be permanently removed. This cannot be undone easily.")
+
+        layout.separator(factor=0.5)
+
+        toggle_icon = 'TRIA_DOWN' if self.show_keys_toggle else 'TRIA_RIGHT'
+        toggle_text = (
+            f"Hide keys to be deleted ({self.key_count})"
+            if self.show_keys_toggle else
+            f"Show keys to be deleted ({self.key_count})"
+        )
+        layout.prop(self, "show_keys_toggle", text=toggle_text, toggle=True, icon=toggle_icon)
+
+        if self.show_keys_toggle:
+            row = layout.row(align=True)
+            row.prop(context.scene, "skp_delete_filter", text="", icon='VIEWZOOM',
+                     placeholder="Filter keys...")
+            if context.scene.skp_delete_filter:
+                row.operator("skp.delete_filter_clear", text="", icon='X')
+
+            rows = max(5, min(30, self.key_count))
+            layout.template_list(
+                "SKP_UL_delete_preview", "",
+                context.scene, "skp_delete_preview",
+                context.scene, "skp_delete_preview_index",
+                rows=rows,
+            )
+
+        layout.separator(factor=0.5)
+
+        if remaining > 0:
+            secs = int(remaining) + 1
+            warn_row = layout.row()
+            warn_row.alert = True
+            warn_row.label(text=f"OK available in {secs}s - read the warning above", icon='TIME')
+        else:
+            layout.label(text="Cooldown complete. Click OK to confirm.", icon='CHECKMARK')
+
+
 class SKP_OT_PageNext(Operator):
     bl_idname = "skp.page_next"
     bl_label = "Next Page"
@@ -1339,6 +1479,7 @@ class SKP_PT_MainPanel(Panel):
 
         # New shape key button
         layout.operator("skp.new_key", text="New Shape Key from Mix", icon='ADD')
+        layout.operator("skp.delete_empty_keys", text="Delete Empty Blendshapes", icon='TRASH')
 
         layout.separator(factor=0.3)
         sub = layout.row()
@@ -1466,6 +1607,7 @@ CLASSES = [
     SKP_OT_NewKey,
     SKP_OT_DeleteCategory,
     SKP_OT_DeleteFilterClear,
+    SKP_OT_DeleteEmptyKeys,
     SKP_OT_PageNext,
     SKP_OT_PagePrev,
     SKP_OT_PageFirst,
