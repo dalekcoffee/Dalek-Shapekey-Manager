@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Dalek (https://dalek.coffee)
 
 """
-Dalek's Shapekey Manager - Blender 5.0 Add-on  v1.5.1
+Dalek's Shapekey Manager - Blender 5.0 Add-on  v1.6
 
 Shape keys whose names match ===ANYTHING=== are treated as category
 dividers. They are displayed as section headers, never selected, never
@@ -16,7 +16,7 @@ divider is detected, letting you filter the list to a single category.
 bl_info = {
     "name": "Dalek's Shapekey Manager",
     "author": "Generated for Blender 5.0",
-    "version": (1, 5, 1),
+    "version": (1, 6, 0),
     "blender": (5, 0, 0),
     "location": "Properties > Object Data > Shape Keys > Dalek's Shapekey Manager",
     "description": "Preview, filter, manage and audit large numbers of shape keys",
@@ -232,17 +232,37 @@ def build_category_enum(self, context):
     """
     Dynamic EnumProperty items callback.
     ALL first, then top-level categories, then sub-categories indented under their parent.
+    Each label is suffixed with the count of real shape keys it contains.
     """
-    items = [('ALL', "All Categories", "Show all shape keys")]
     obj = context.active_object if context else None
+    if not obj or not obj.data or not obj.data.shape_keys:
+        return [('ALL', "All Categories", "Show all shape keys")]
+
+    full_info = _build_full_map(obj)
+    blocks = obj.data.shape_keys.key_blocks
+
+    # Count all real keys (non-divider). Basis is included to match the Total stat.
+    total = sum(1 for kb in blocks if not is_category_divider(kb.name))
+
+    items = [('ALL', f"All Categories ({total})", "Show all shape keys")]
+
     tree = get_category_tree(obj)
     for entry in tree:
         label = entry['label']
         if entry['kind'] == 'top':
-            items.append((label, label, f"Top-level category: {label}"))
+            count = sum(
+                1 for kb in blocks
+                if full_info.get(kb.name, {}).get('kind') == 'key'
+                and full_info.get(kb.name, {}).get('parent') == label
+            )
+            items.append((label, f"{label} ({count})", f"Top-level category: {label}"))
         else:
-            indent = f"  {label}"
-            items.append((label, indent, f"Sub-category: {label}"))
+            count = sum(
+                1 for kb in blocks
+                if full_info.get(kb.name, {}).get('kind') == 'key'
+                and full_info.get(kb.name, {}).get('sub') == label
+            )
+            items.append((label, f"  {label} ({count})", f"Sub-category: {label}"))
     return items
 
 
@@ -523,12 +543,24 @@ def _apply_step(context, delta):
 
 class SKP_OT_PreviewKey(Operator):
     """Set this shape key to the preview value; optionally reset others.
+    Hold Shift when clicking to extend: preview this key without resetting others
+    (overrides Auto Reset for this click).
     Category divider keys are never passed to this operator."""
     bl_idname = "skp.preview_key"
     bl_label = "Preview Shape Key"
     bl_options = {'REGISTER', 'UNDO'}
 
     key_name: StringProperty()
+    extend: BoolProperty(
+        name="Extend",
+        description="If true, do not reset other keys (shift-click behaviour)",
+        default=False,
+        options={'SKIP_SAVE'},
+    )
+
+    def invoke(self, context, event):
+        self.extend = event.shift
+        return self.execute(context)
 
     def execute(self, context):
         obj = context.active_object
@@ -545,7 +577,7 @@ class SKP_OT_PreviewKey(Operator):
 
         blocks = obj.data.shape_keys.key_blocks
 
-        if props.auto_reset:
+        if props.auto_reset and not self.extend:
             for kb in blocks:
                 if kb.name != "Basis" and not is_category_divider(kb.name):
                     kb.value = 0.0
@@ -1086,11 +1118,23 @@ class SKP_OT_CopyKeyName(Operator):
 class SKP_OT_SelectAndPreview(Operator):
     """Click to select a shape key. Click again on the active key to deselect
     (zeroes its value and returns focus to Basis).
+    Hold Shift and click to enable multiple keys at once without resetting the
+    others (toggles this key only; shift-clicking a non-zero key zeros it).
     Category dividers are never passed to this operator."""
     bl_idname = "skp.select_and_preview"
     bl_label = "Select Key"
 
     key_name: StringProperty()
+    extend: BoolProperty(
+        name="Extend",
+        description="If true, toggle this key without resetting others (shift-click)",
+        default=False,
+        options={'SKIP_SAVE'},
+    )
+
+    def invoke(self, context, event):
+        self.extend = event.shift
+        return self.execute(context)
 
     def execute(self, context):
         obj = context.active_object
@@ -1110,10 +1154,27 @@ class SKP_OT_SelectAndPreview(Operator):
         current_idx = obj.active_shape_key_index
         target_idx = list(blocks.keys()).index(self.key_name)
         already_active = (current_idx == target_idx)
+        kb = blocks[self.key_name]
+
+        if self.extend:
+            # Shift-click: toggle this key only, leaving every other key untouched.
+            # Focus moves to this key so the preview slider + step cursor target it.
+            obj.active_shape_key_index = target_idx
+            filtered = get_filtered_keys(obj, props)
+            for fi, (_, k) in enumerate(filtered):
+                if k.name == self.key_name:
+                    props.step_index = fi
+                    break
+
+            if kb.value > 0.0:
+                kb.value = 0.0
+            else:
+                kb.value = props.preview_value
+            return {'FINISHED'}
 
         if already_active:
             # Deselect: zero this key's value and move active back to Basis
-            blocks[self.key_name].value = 0.0
+            kb.value = 0.0
             basis_idx = list(blocks.keys()).index('Basis') if 'Basis' in blocks else 0
             obj.active_shape_key_index = basis_idx
             props.step_index = -1
@@ -1121,8 +1182,8 @@ class SKP_OT_SelectAndPreview(Operator):
             # Select normally
             obj.active_shape_key_index = target_idx
             filtered = get_filtered_keys(obj, props)
-            for fi, (_, kb) in enumerate(filtered):
-                if kb.name == self.key_name:
+            for fi, (_, k) in enumerate(filtered):
+                if k.name == self.key_name:
                     props.step_index = fi
                     break
 
@@ -1262,6 +1323,9 @@ class SKP_PT_MainPanel(Panel):
         row = box.row(align=True)
         row.prop(props, "auto_reset", toggle=True)
         row.prop(props, "auto_preview", toggle=True)
+        hint_row = box.row()
+        hint_row.enabled = False
+        hint_row.label(text="Tip: Shift-click to toggle a key without resetting others", icon='INFO')
         row = box.row()
         row.operator("skp.reset_all", icon='LOOP_BACK', text="Reset All to 0")
 
