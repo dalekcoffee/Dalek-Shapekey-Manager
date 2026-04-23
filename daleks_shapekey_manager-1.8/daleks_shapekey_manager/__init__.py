@@ -16,7 +16,7 @@ divider is detected, letting you filter the list to a single category.
 bl_info = {
     "name": "Dalek's Shapekey Manager",
     "author": "Generated for Blender 5.0",
-    "version": (1, 8, 1),
+    "version": (1, 8, 2),
     "blender": (5, 0, 0),
     "location": "Properties > Object Data > Shape Keys > Dalek's Shapekey Manager",
     "description": "Preview, filter, manage and audit large numbers of shape keys",
@@ -125,6 +125,7 @@ _ENUM_ITEMS_HOLD: list = []
 _MAP_CACHE = {
     'sk_ptr': None,
     'n_blocks': 0,
+    'name_sig': None,          # hash of key names - detects renames without length change
     'prefs_version': -1,
     'full_info': None,
     'category_tree': None,
@@ -137,6 +138,17 @@ _MAP_CACHE = {
     'total_real': 0,           # real keys excluding Basis (matches default Shown count)
     'has_basis': False,
 }
+
+
+def _compute_name_signature(blocks):
+    """Cheap fingerprint of the current key_blocks order + names.
+
+    Length alone misses renames and reorders (both leave n_blocks and the
+    shape_keys datablock pointer unchanged). This fingerprint catches
+    those, at the cost of one tuple(hash(name)...) per cache lookup -
+    microseconds even for thousands of keys, orders of magnitude less
+    than a full rebuild."""
+    return hash(tuple(kb.name for kb in blocks))
 
 
 def _bump_prefs_version():
@@ -283,6 +295,7 @@ def _rebuild_cache(obj):
     _MAP_CACHE.update({
         'sk_ptr': shape_keys.as_pointer(),
         'n_blocks': len(blocks),
+        'name_sig': _compute_name_signature(blocks),
         'prefs_version': _PREFS_VERSION,
         'full_info': full_info,
         'category_tree': category_tree,
@@ -304,11 +317,13 @@ def _get_cache(obj):
         return None
     shape_keys = obj.data.shape_keys
     sk_ptr = shape_keys.as_pointer()
-    n = len(shape_keys.key_blocks)
+    blocks = shape_keys.key_blocks
+    n = len(blocks)
     if (_MAP_CACHE['sk_ptr'] == sk_ptr
             and _MAP_CACHE['n_blocks'] == n
             and _MAP_CACHE['prefs_version'] == _PREFS_VERSION
-            and _MAP_CACHE['full_info'] is not None):
+            and _MAP_CACHE['full_info'] is not None
+            and _MAP_CACHE['name_sig'] == _compute_name_signature(blocks)):
         return _MAP_CACHE
     return _rebuild_cache(obj)
 
@@ -468,26 +483,32 @@ def get_filtered_keys(obj, props):
     blocks = obj.data.shape_keys.key_blocks
     show_basis = props.show_basis
 
-    # real_key_entries is pre-filtered to exclude dividers (built once per
-    # structural change in _rebuild_cache), so no per-key divider test here.
+    # Carry the cached name alongside the live kb so the category filter's
+    # full_info lookup uses the same string that seeded full_info. Looking
+    # up by kb.name would orphan any key renamed in a window where the
+    # cache is technically still valid (same sk_ptr, same length).
+    # real_key_entries is pre-filtered to exclude dividers, so no per-key
+    # divider test here.
     if show_basis:
-        keys = [(i, blocks[i]) for i, _name in cache['real_key_entries']]
+        entries = [(i, name, blocks[i]) for i, name in cache['real_key_entries']]
     else:
-        keys = [(i, blocks[i]) for i, name in cache['real_key_entries']
-                if name != "Basis"]
+        entries = [(i, name, blocks[i]) for i, name in cache['real_key_entries']
+                   if name != "Basis"]
 
     # Category filter (only when categories exist)
     cat_filter = props.category_filter
     if cat_filter and cat_filter != 'ALL':
         full_info = cache['full_info']
         parent_key = 'parent' if cat_filter in cache['top_labels'] else 'sub'
-        keys = [(i, kb) for i, kb in keys
-                if full_info.get(kb.name, {}).get(parent_key) == cat_filter]
+        entries = [(i, n, kb) for i, n, kb in entries
+                   if full_info.get(n, {}).get(parent_key) == cat_filter]
 
-    # Text search
+    # Text search - filter on the LIVE name so users filter on what they see
     query = props.search_filter.strip().lower()
     if query:
-        keys = [(i, kb) for i, kb in keys if query in kb.name.lower()]
+        entries = [(i, n, kb) for i, n, kb in entries if query in kb.name.lower()]
+
+    keys = [(i, kb) for i, _n, kb in entries]
 
     # Sort (only meaningful when sort != NONE; categories not preserved in other modes)
     mode = props.sort_mode
