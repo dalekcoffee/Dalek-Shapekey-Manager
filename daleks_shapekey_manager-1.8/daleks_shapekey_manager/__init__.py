@@ -16,7 +16,7 @@ divider is detected, letting you filter the list to a single category.
 bl_info = {
     "name": "Dalek's Shapekey Manager",
     "author": "Generated for Blender 5.0",
-    "version": (1, 7, 0),
+    "version": (1, 8, 1),
     "blender": (5, 0, 0),
     "location": "Properties > Object Data > Shape Keys > Dalek's Shapekey Manager",
     "description": "Preview, filter, manage and audit large numbers of shape keys",
@@ -114,6 +114,14 @@ class SKP_AddonPreferences(bpy.types.AddonPreferences):
 _PATTERNS_CACHE = {'value': None, 'version': -1}
 _PREFS_VERSION = 0
 
+# Blender's EnumProperty items callback hands back raw pointers to the
+# strings inside each tuple - it does NOT keep its own copies. If Python
+# GCs the previous list before Blender reads it the dropdown renders
+# freed memory, which looks like category labels/counts drifting or
+# "blending" together after many redraws/deletions. Hold a strong
+# reference here so the strings outlive Blender's access.
+_ENUM_ITEMS_HOLD: list = []
+
 _MAP_CACHE = {
     'sk_ptr': None,
     'n_blocks': 0,
@@ -126,7 +134,8 @@ _MAP_CACHE = {
     'member_counts': None,     # {label -> real-key count}
     'delete_counts': None,     # {label -> total entries Delete-Category would remove}
     'has_categories': False,
-    'total_real': 0,
+    'total_real': 0,           # real keys excluding Basis (matches default Shown count)
+    'has_basis': False,
 }
 
 
@@ -265,6 +274,12 @@ def _rebuild_cache(obj):
                 member_counts[parent] = member_counts.get(parent, 0) + 1
                 delete_counts[parent] = delete_counts.get(parent, 0) + 1
 
+    # Basis is in real_key_entries (so "Show Basis" can surface it) but the
+    # default view hides it. Report total_real as the count the user will
+    # see by default; the panel adds +1 when Show Basis is toggled on.
+    has_basis = any(name == "Basis" for _, name in real_key_entries)
+    total_real = len(real_key_entries) - (1 if has_basis else 0)
+
     _MAP_CACHE.update({
         'sk_ptr': shape_keys.as_pointer(),
         'n_blocks': len(blocks),
@@ -277,7 +292,8 @@ def _rebuild_cache(obj):
         'member_counts': member_counts,
         'delete_counts': delete_counts,
         'has_categories': bool(categories),
-        'total_real': len(real_key_entries),
+        'total_real': total_real,
+        'has_basis': has_basis,
     })
     return _MAP_CACHE
 
@@ -298,13 +314,24 @@ def _get_cache(obj):
 
 
 def build_category_enum(self, context):
-    """EnumProperty items callback - fires on every panel redraw."""
+    """EnumProperty items callback - fires on every panel redraw.
+
+    The returned list is stashed in _ENUM_ITEMS_HOLD so Python keeps the
+    strings alive for as long as Blender is referencing their pointers.
+    Without this the dropdown renders freed memory and the counts appear
+    to drift the more the user interacts with the panel."""
+    global _ENUM_ITEMS_HOLD
     obj = context.active_object if context else None
     cache = _get_cache(obj)
     if cache is None:
-        return [('ALL', "All Categories", "Show all shape keys")]
+        items = [('ALL', "All Categories", "Show all shape keys")]
+        _ENUM_ITEMS_HOLD = items
+        return items
 
-    total = cache['total_real']
+    props = context.scene.skp_props if context and hasattr(context.scene, 'skp_props') else None
+    show_basis = bool(props.show_basis) if props else False
+    total = cache['total_real'] + (1 if show_basis and cache.get('has_basis') else 0)
+
     items = [('ALL', f"All Categories ({total})", "Show all shape keys")]
     member_counts = cache['member_counts']
     for entry in cache['category_tree']:
@@ -314,6 +341,7 @@ def build_category_enum(self, context):
             items.append((label, f"{label} ({count})", f"Top-level category: {label}"))
         else:
             items.append((label, f"  {label} ({count})", f"Sub-category: {label}"))
+    _ENUM_ITEMS_HOLD = items
     return items
 
 
@@ -1454,7 +1482,9 @@ class SKP_PT_MainPanel(Panel):
         cache = _get_cache(obj)
         has_categories = cache['has_categories']
         categories = cache['categories']
-        total_real = cache['total_real']
+        # total_real excludes Basis; add it back when the user has opted to
+        # see it so Total and Shown line up with no filter applied.
+        total_real = cache['total_real'] + (1 if props.show_basis and cache.get('has_basis') else 0)
 
         filtered = get_filtered_keys(obj, props)
         total_filtered = len(filtered)
