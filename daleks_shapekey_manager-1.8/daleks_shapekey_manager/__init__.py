@@ -16,12 +16,22 @@ divider is detected, letting you filter the list to a single category.
 bl_info = {
     "name": "Dalek's Shapekey Manager",
     "author": "Generated for Blender 5.0",
-    "version": (1, 8, 3),
+    "version": (1, 8, 4),
     "blender": (5, 0, 0),
     "location": "Properties > Object Data > Shape Keys > Dalek's Shapekey Manager",
     "description": "Preview, filter, manage and audit large numbers of shape keys",
     "category": "Mesh",
 }
+
+# Duplicate of bl_info['version'] as a module-level constant so runtime
+# code (e.g. the debug dump) can reference the version without touching
+# bl_info. Blender 4.2+ extensions may omit bl_info from the module
+# namespace at import time, which would raise NameError on access.
+_ADDON_VERSION = (1, 8, 4)
+
+
+def _addon_version_tuple():
+    return _ADDON_VERSION
 
 import time
 import bpy
@@ -131,9 +141,16 @@ _MAP_CACHE = {
     'category_tree': None,
     'categories': None,
     'top_labels': None,
+    'sub_labels': None,
     'real_key_entries': None,  # list[(index, name)] excluding dividers, in original order
-    'member_counts': None,     # {label -> real-key count}
-    'delete_counts': None,     # {label -> total entries Delete-Category would remove}
+    # Counts are keyed separately per level: when a label like "Eyeline" is
+    # used as BOTH a ===top=== divider and a ---sub--- divider elsewhere,
+    # a single dict collapsed both into one entry and the visible counts
+    # drifted away from what Delete Category would actually remove.
+    'top_member_counts': None,  # {top label -> real-key count in that top}
+    'top_delete_counts': None,  # {top label -> total entries a top-delete removes}
+    'sub_member_counts': None,  # {sub label -> real-key count directly under that sub}
+    'sub_delete_counts': None,  # {sub label -> total entries a sub-delete removes}
     'has_categories': False,
     'total_real': 0,           # real keys excluding Basis (matches default Shown count)
     'has_basis': False,
@@ -218,9 +235,12 @@ def _rebuild_cache(obj):
     category_tree = []
     categories = []
     top_labels = set()
+    sub_labels = set()
     real_key_entries = []
-    member_counts = {}
-    delete_counts = {}
+    top_member_counts = {}
+    top_delete_counts = {}
+    sub_member_counts = {}
+    sub_delete_counts = {}
     seen_tree = set()
     seen_cat = set()
 
@@ -252,8 +272,8 @@ def _rebuild_cache(obj):
                 categories.append(label)
             top_labels.add(label)
             # The top divider itself contributes +1 to its own delete count
-            delete_counts[label] = delete_counts.get(label, 0) + 1
-            member_counts.setdefault(label, 0)
+            top_delete_counts[label] = top_delete_counts.get(label, 0) + 1
+            top_member_counts.setdefault(label, 0)
         elif kind == 'sub':
             current_sub = label
             parent = current_top or None
@@ -266,13 +286,14 @@ def _rebuild_cache(obj):
             if label not in seen_cat:
                 seen_cat.add(label)
                 categories.append(label)
+            sub_labels.add(label)
             # Sub divider itself counts once for its own deletion, and once
             # toward the enclosing top's deletion (top-delete removes all
             # sub dividers nested under it too).
-            delete_counts[label] = delete_counts.get(label, 0) + 1
+            sub_delete_counts[label] = sub_delete_counts.get(label, 0) + 1
             if parent:
-                delete_counts[parent] = delete_counts.get(parent, 0) + 1
-            member_counts.setdefault(label, 0)
+                top_delete_counts[parent] = top_delete_counts.get(parent, 0) + 1
+            sub_member_counts.setdefault(label, 0)
         else:
             parent = current_top or None
             sub = current_sub or None
@@ -280,11 +301,11 @@ def _rebuild_cache(obj):
                                'sub': sub, 'label': name}
             real_key_entries.append((i, name))
             if sub:
-                member_counts[sub] = member_counts.get(sub, 0) + 1
-                delete_counts[sub] = delete_counts.get(sub, 0) + 1
+                sub_member_counts[sub] = sub_member_counts.get(sub, 0) + 1
+                sub_delete_counts[sub] = sub_delete_counts.get(sub, 0) + 1
             if parent:
-                member_counts[parent] = member_counts.get(parent, 0) + 1
-                delete_counts[parent] = delete_counts.get(parent, 0) + 1
+                top_member_counts[parent] = top_member_counts.get(parent, 0) + 1
+                top_delete_counts[parent] = top_delete_counts.get(parent, 0) + 1
 
     # Basis is in real_key_entries (so "Show Basis" can surface it) but the
     # default view hides it. Report total_real as the count the user will
@@ -301,9 +322,12 @@ def _rebuild_cache(obj):
         'category_tree': category_tree,
         'categories': categories,
         'top_labels': top_labels,
+        'sub_labels': sub_labels,
         'real_key_entries': real_key_entries,
-        'member_counts': member_counts,
-        'delete_counts': delete_counts,
+        'top_member_counts': top_member_counts,
+        'top_delete_counts': top_delete_counts,
+        'sub_member_counts': sub_member_counts,
+        'sub_delete_counts': sub_delete_counts,
         'has_categories': bool(categories),
         'total_real': total_real,
         'has_basis': has_basis,
@@ -348,16 +372,49 @@ def build_category_enum(self, context):
     total = cache['total_real'] + (1 if show_basis and cache.get('has_basis') else 0)
 
     items = [('ALL', f"All Categories ({total})", "Show all shape keys")]
-    member_counts = cache['member_counts']
+    # Identifier format: "<kind>\x1f<label>" so a label that exists at both
+    # top AND sub produces two distinct enum entries instead of colliding
+    # on the same identifier. _decode_category_filter / get_filtered_keys
+    # read the kind prefix to filter on the correct level.
+    top_mem = cache['top_member_counts']
+    sub_mem = cache['sub_member_counts']
     for entry in cache['category_tree']:
         label = entry['label']
-        count = member_counts.get(label, 0)
         if entry['kind'] == 'top':
-            items.append((label, f"{label} ({count})", f"Top-level category: {label}"))
+            count = top_mem.get(label, 0)
+            ident = f"top\x1f{label}"
+            items.append((ident, f"{label} ({count})",
+                          f"Top-level category: {label}"))
         else:
-            items.append((label, f"  {label} ({count})", f"Sub-category: {label}"))
+            count = sub_mem.get(label, 0)
+            ident = f"sub\x1f{label}"
+            parent = entry.get('parent') or ''
+            desc = (f"Sub-category '{label}' under '{parent}'" if parent
+                    else f"Sub-category: {label}")
+            items.append((ident, f"  {label} ({count})", desc))
     _ENUM_ITEMS_HOLD = items
     return items
+
+
+def _decode_category_filter(cat_filter, cache):
+    """Split an encoded category_filter value into (kind, label).
+
+    Accepts both the new "<kind>\x1f<label>" form and the legacy plain-
+    label form (saved into scene state before this release). For the
+    legacy form, fall back to top_labels membership to pick a kind."""
+    if not cat_filter or cat_filter == 'ALL':
+        return None, cat_filter
+    if '\x1f' in cat_filter:
+        kind, _, label = cat_filter.partition('\x1f')
+        if kind in ('top', 'sub') and label:
+            return kind, label
+    # Legacy plain label - classify by which set it lives in.
+    if cache is not None:
+        if cat_filter in (cache.get('top_labels') or set()):
+            return 'top', cat_filter
+        if cat_filter in (cache.get('sub_labels') or set()):
+            return 'sub', cat_filter
+    return 'top', cat_filter
 
 
 # -----------------------------------------
@@ -499,9 +556,10 @@ def get_filtered_keys(obj, props):
     cat_filter = props.category_filter
     if cat_filter and cat_filter != 'ALL':
         full_info = cache['full_info']
-        parent_key = 'parent' if cat_filter in cache['top_labels'] else 'sub'
+        kind, label = _decode_category_filter(cat_filter, cache)
+        parent_key = 'parent' if kind == 'top' else 'sub'
         entries = [(i, n, kb) for i, n, kb in entries
-                   if full_info.get(n, {}).get(parent_key) == cat_filter]
+                   if full_info.get(n, {}).get(parent_key) == label]
 
     # Text search - filter on the LIVE name so users filter on what they see
     query = props.search_filter.strip().lower()
@@ -800,6 +858,11 @@ class SKP_OT_DeleteCategory(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     category_name: StringProperty()
+    # Which level of divider to target. Empty falls back to the previous
+    # "is top if label is in top_labels" heuristic, which is ambiguous when
+    # a label exists at both levels - callers from this addon always set
+    # this explicitly so the wrong-level deletion can't happen.
+    category_kind: StringProperty(default='')
     key_count: IntProperty()
     respect_filter: BoolProperty(
         name="Respect Filter",
@@ -829,7 +892,10 @@ class SKP_OT_DeleteCategory(Operator):
         if cache is None:
             return []
         cat = self.category_name
-        is_top = cat in cache['top_labels']
+        if self.category_kind in ('top', 'sub'):
+            is_top = self.category_kind == 'top'
+        else:
+            is_top = cat in cache['top_labels']
 
         result = []
         for name, d in cache['full_info'].items():
@@ -1590,13 +1656,18 @@ class SKP_PT_MainPanel(Panel):
             del_cat_row.enabled = is_specific_cat
             if is_specific_cat:
                 # Count pre-computed in _rebuild_cache - no extra scan.
-                n_total = cache['delete_counts'].get(active_cat, 0)
+                kind, label = _decode_category_filter(active_cat, cache)
+                if kind == 'top':
+                    n_total = cache['top_delete_counts'].get(label, 0)
+                else:
+                    n_total = cache['sub_delete_counts'].get(label, 0)
                 del_op = del_cat_row.operator(
                     "skp.delete_category",
                     text=f"Delete Category ({n_total})",
                     icon='TRASH',
                 )
-                del_op.category_name = active_cat
+                del_op.category_name = label
+                del_op.category_kind = kind
                 del_op.key_count = n_total
                 del_op.respect_filter = False
             else:
@@ -1657,7 +1728,8 @@ class SKP_PT_MainPanel(Panel):
             #   - A top-level category is selected (show sub headers within it)
             # Not when a sub-category is selected (single flat group, no headers needed)
             cat_filter = props.category_filter
-            viewing_top = cat_filter in cache['top_labels']
+            _vkind, _vlabel = _decode_category_filter(cat_filter, cache)
+            viewing_top = _vkind == 'top' and cat_filter != 'ALL'
             viewing_all = cat_filter == 'ALL'
 
             inject_headers = (
@@ -1692,6 +1764,7 @@ class SKP_PT_MainPanel(Panel):
                                 "skp.delete_category", text="", icon='TRASH',
                             )
                             top_del.category_name = this_top
+                            top_del.category_kind = 'top'
                             top_del.respect_filter = True
                         elif not this_top and not this_sub:
                             top_row = col.row()
@@ -1712,6 +1785,7 @@ class SKP_PT_MainPanel(Panel):
                             "skp.delete_category", text="", icon='TRASH',
                         )
                         sub_del.category_name = this_sub
+                        sub_del.category_kind = 'sub'
                         sub_del.respect_filter = True
 
                 is_active = (idx == active_idx)
@@ -1953,12 +2027,14 @@ def _debug_diff_rows(cache, metrics):
         label = entry['label']
         kind = entry['kind']
         parent = entry.get('parent') or ''
-        cached_mem = cache['member_counts'].get(label, 0)
-        cached_del = cache['delete_counts'].get(label, 0)
         if kind == 'top':
+            cached_mem = cache['top_member_counts'].get(label, 0)
+            cached_del = cache['top_delete_counts'].get(label, 0)
             live_mem = metrics['per_top_members'].get(label, 0)
             live_del = metrics['per_top_delete'].get(label, 0)
         else:
+            cached_mem = cache['sub_member_counts'].get(label, 0)
+            cached_del = cache['sub_delete_counts'].get(label, 0)
             live_mem = metrics['per_sub_members'].get(label, 0)
             live_del = metrics['per_sub_delete'].get(label, 0)
         yield (label, kind, parent, cached_mem, live_mem, cached_del, live_del,
@@ -1991,7 +2067,9 @@ class SKP_OT_DebugDump(Operator):
         print(sep)
         print(f"  Object           : {obj.name}")
         print(f"  Shape keys block : {obj.data.shape_keys.name}")
-        print(f"  addon version    : {bl_info['version']}")
+        # bl_info is not reliably available in Blender 4.2+ extension runtime
+        # (the extension loader may strip it). Pull from the manifest instead.
+        print(f"  addon version    : {_addon_version_tuple()}")
         print()
         print("CACHE STATE")
         print(sub)
@@ -2057,9 +2135,10 @@ class SKP_OT_DebugDump(Operator):
         print(f"  current_page      : {props.current_page}")
         print(f"  page_size         : {props.page_size}")
         print(f"  filtered length   : {len(filtered)}")
-        cat = props.category_filter
-        if cat and cat != 'ALL':
-            is_top = cat in cache['top_labels']
+        cat_raw = props.category_filter
+        if cat_raw and cat_raw != 'ALL':
+            _k, cat = _decode_category_filter(cat_raw, cache)
+            is_top = _k == 'top'
             full_info = cache['full_info']
             parent_key = 'parent' if is_top else 'sub'
             recount_all = sum(1 for _, n in cache['real_key_entries']
@@ -2073,12 +2152,14 @@ class SKP_OT_DebugDump(Operator):
                 if info and info.get(parent_key) == cat and kb.name != 'Basis':
                     recount_by_kb += 1
             print(f"  classified        : {'TOP' if is_top else 'SUB'}")
-            print(f"  cached member     : {cache['member_counts'].get(cat, 0)}")
-            print(f"  cached delete     : {cache['delete_counts'].get(cat, 0)}")
             if is_top:
+                print(f"  cached member     : {cache['top_member_counts'].get(cat, 0)}")
+                print(f"  cached delete     : {cache['top_delete_counts'].get(cat, 0)}")
                 print(f"  live member (top) : {metrics['per_top_members'].get(cat, 0)}")
                 print(f"  live delete (top) : {metrics['per_top_delete'].get(cat, 0)}")
             else:
+                print(f"  cached member     : {cache['sub_member_counts'].get(cat, 0)}")
+                print(f"  cached delete     : {cache['sub_delete_counts'].get(cat, 0)}")
                 print(f"  live member (sub) : {metrics['per_sub_members'].get(cat, 0)}")
                 print(f"  live delete (sub) : {metrics['per_sub_delete'].get(cat, 0)}")
             print(f"  recount (all)     : {recount_all}")
@@ -2262,27 +2343,33 @@ class SKP_PT_DebugPanel(Panel):
         if metrics['sub_name_duplicates']:
             _flag_row(f"sub label reused: {', '.join(metrics['sub_name_duplicates'][:3])}")
         if metrics['cross_level_collisions']:
-            _flag_row(f"label is both top AND sub: {', '.join(metrics['cross_level_collisions'][:3])}")
+            xs = metrics['cross_level_collisions']
+            head = ', '.join(xs[:6])
+            more = f" (+{len(xs) - 6} more)" if len(xs) > 6 else ''
+            _flag_row(f"label is both top AND sub: {head}{more}")
         if metrics['orphan_subs']:
             _flag_row(f"orphan sub dividers (no top): {len(metrics['orphan_subs'])}")
         if metrics['sub_multiple_parents']:
             _flag_row(f"sub nested under multiple tops: {len(metrics['sub_multiple_parents'])}")
 
         # --- Focus: currently selected category ---
-        cat = props.category_filter
-        if cat and cat != 'ALL':
+        cat_raw = props.category_filter
+        if cat_raw and cat_raw != 'ALL':
+            _fkind, cat = _decode_category_filter(cat_raw, cache)
+            is_top = _fkind == 'top'
             box2 = layout.box()
             box2.label(text=f"Focus: {cat}", icon='OUTLINER_COLLECTION')
             col2 = box2.column(align=True)
-            is_top = cat in cache['top_labels']
             col2.label(text=f"classified as: {'TOP' if is_top else 'SUB'}")
 
-            cached_mem = cache['member_counts'].get(cat, 0)
-            cached_del = cache['delete_counts'].get(cat, 0)
             if is_top:
+                cached_mem = cache['top_member_counts'].get(cat, 0)
+                cached_del = cache['top_delete_counts'].get(cat, 0)
                 live_mem = metrics['per_top_members'].get(cat, 0)
                 live_del = metrics['per_top_delete'].get(cat, 0)
             else:
+                cached_mem = cache['sub_member_counts'].get(cat, 0)
+                cached_del = cache['sub_delete_counts'].get(cat, 0)
                 live_mem = metrics['per_sub_members'].get(cat, 0)
                 live_del = metrics['per_sub_delete'].get(cat, 0)
 
@@ -2301,6 +2388,12 @@ class SKP_PT_DebugPanel(Panel):
             recount_no_basis = sum(1 for _, n in cache['real_key_entries']
                                    if n != 'Basis'
                                    and full_info.get(n, {}).get(parent_key) == cat)
+            # Also note when this label exists at both levels so the user
+            # knows why the dropdown now has two entries for the same name.
+            if cat in cache.get('top_labels', ()) and cat in cache.get('sub_labels', ()):
+                r = col2.row()
+                r.alert = True
+                r.label(text="label exists at BOTH top AND sub", icon='INFO')
             shown_expected = recount_all if props.show_basis else recount_no_basis
             r = col2.row()
             r.alert = len(filtered) != shown_expected
