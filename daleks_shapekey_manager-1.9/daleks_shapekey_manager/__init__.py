@@ -18,7 +18,7 @@ divider is detected, letting you filter the list to a single category.
 # on every release. Blender 4.2+ extensions may strip bl_info from the
 # runtime module namespace, so other code paths (e.g. the debug dump)
 # read _ADDON_VERSION directly.
-_ADDON_VERSION = (1, 10, 3)
+_ADDON_VERSION = (1, 10, 4)
 
 bl_info = {
     "name": "Dalek's Shapekey Manager",
@@ -794,6 +794,27 @@ class SKP_Properties(PropertyGroup):
             "When doing a bulk copy, skip keys that already exist on the "
             "target instead of overwriting them. Per-row Copy buttons "
             "always overwrite, regardless of this toggle"
+        ),
+        default=True,
+    )
+
+    sync_match_groups: BoolProperty(
+        name="Match Groups",
+        description=(
+            "When copying, place each key under the same category divider "
+            "(group) it has on the Reference. If the group's divider doesn't "
+            "exist on the Target, you'll be asked / it can be created"
+        ),
+        default=True,
+    )
+
+    sync_create_groups: BoolProperty(
+        name="Create Missing Groups",
+        description=(
+            "When 'Match Groups' is on and a key's category divider is missing "
+            "on the Target, create it (as an empty divider shape key). Turn off "
+            "to leave such keys ungrouped instead. Used by the bulk copy "
+            "actions; the single-key copy asks each time a new group is needed"
         ),
         default=True,
     )
@@ -3463,6 +3484,16 @@ class SKP_PT_MainPanel(Panel):
 
                 del_op = row.operator("skp.delete_key", text="", icon='X')
                 del_op.key_name = kb.name
+
+        # Bottom pager mirrors the top one so you don't have to scroll back up
+        # to move between pages on a long list.
+        if num_pages > 1:
+            row = layout.row(align=True)
+            row.operator("skp.page_first", text="", icon='REW')
+            row.operator("skp.page_prev",  text="", icon='TRIA_LEFT')
+            row.label(text=f"Page {current_page + 1} / {num_pages}")
+            row.operator("skp.page_next",  text="", icon='TRIA_RIGHT')
+            row.operator("skp.page_last",  text="", icon='FF')
 
         layout.separator(factor=0.5)
 

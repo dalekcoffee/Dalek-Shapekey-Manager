@@ -39,6 +39,8 @@ from . import (
     _get_cache,
     _reference_file_missing,
     _shape_key_names,
+    category_label,
+    divider_kind,
     get_sync_filtered_keys,
     is_category_divider,
     total_pages,
@@ -468,6 +470,203 @@ def _sync_collect_missing(reference, target):
     ]
 
 
+# -----------------------------------------
+#  Group-aware placement (category dividers)
+# -----------------------------------------
+#
+# "Groups" are empty divider shape keys whose names match the configured
+# divider patterns. A key's group is purely positional: it belongs to the most
+# recent divider above it. So to copy a key "into its group" on the Target we
+# must (a) make sure the divider(s) exist and (b) move the copied key to sit
+# directly under them.
+
+def _group_dividers_for_keys(obj):
+    """Map each real key name -> (top_divider_name, sub_divider_name) for obj,
+    using shape-key order + divider patterns. Divider names are the exact key
+    names (token-wrapped), so they can be recreated verbatim on another mesh."""
+    result = {}
+    if obj is None or obj.data is None or obj.data.shape_keys is None:
+        return result
+    cur_top = None
+    cur_sub = None
+    for kb in obj.data.shape_keys.key_blocks:
+        kind, _label = divider_kind(kb.name)
+        if kind == 'top':
+            cur_top = kb.name
+            cur_sub = None
+        elif kind == 'sub':
+            cur_sub = kb.name
+        else:
+            result[kb.name] = (cur_top, cur_sub)
+    return result
+
+
+def _missing_group_dividers(reference, target, names):
+    """Divider names that `names` need (per the Reference) but the Target lacks.
+    Order-preserving, de-duplicated."""
+    if reference is None or target is None:
+        return []
+    ref_map = _group_dividers_for_keys(reference)
+    tgt_blocks = (target.data.shape_keys.key_blocks
+                  if target.data and target.data.shape_keys else None)
+    seen = set()
+    missing = []
+    for nm in names:
+        for div in ref_map.get(nm, (None, None)):
+            if div and div not in seen:
+                seen.add(div)
+                if tgt_blocks is None or tgt_blocks.find(div) < 0:
+                    missing.append(div)
+    return missing
+
+
+def _next_divider_index(blocks, start):
+    """Index of the first divider at or after `start`, else len(blocks)."""
+    n = len(blocks)
+    i = start
+    while i < n:
+        if is_category_divider(blocks[i].name):
+            return i
+        i += 1
+    return n
+
+
+def _current_anchor_name(blocks, idx):
+    """Name of the nearest divider above index idx (the key's current group),
+    or None if it's above all dividers."""
+    j = idx - 1
+    while j >= 0:
+        if is_category_divider(blocks[j].name):
+            return blocks[j].name
+        j -= 1
+    return None
+
+
+def _create_divider_key(target, div_name):
+    """Append an empty (Basis-shaped) divider shape key named div_name."""
+    kb = target.shape_key_add(name=div_name, from_mix=False)
+    kb.value = 0.0
+    return kb
+
+
+def _move_key_to_index(obj, name, target_idx):
+    """Bubble shape key `name` to absolute position target_idx via
+    shape_key_move. Must run with `obj` active + in Object Mode (caller sets up
+    the context override). Re-resolves the live index so it's swap-safe."""
+    sk = obj.data.shape_keys
+    if sk is None:
+        return
+    blocks = sk.key_blocks
+    n = len(blocks)
+    cur = blocks.find(name)
+    if cur < 0:
+        return
+    target_idx = max(0, min(target_idx, n - 1))
+    if cur == target_idx:
+        return
+    obj.active_shape_key_index = cur
+    if cur > target_idx:
+        for _ in range(cur - target_idx):
+            bpy.ops.object.shape_key_move(type='UP')
+    else:
+        for _ in range(target_idx - cur):
+            bpy.ops.object.shape_key_move(type='DOWN')
+
+
+def _apply_group_placement(context, reference, target, names, create_missing):
+    """Place freshly-copied keys under their Reference category divider on the
+    Target, optionally creating missing dividers. Best-effort: the copy has
+    already happened, so any failure here is logged, not fatal.
+    Returns (placed, created_divider_names, ungrouped)."""
+    if not names or reference is None or target is None:
+        return 0, [], 0
+    if target.data is None or target.data.shape_keys is None:
+        return 0, [], 0
+
+    ref_map = _group_dividers_for_keys(reference)
+    jobs = [(nm, *ref_map.get(nm, (None, None))) for nm in names]
+    jobs = [(nm, t, s) for nm, t, s in jobs if t or s]
+    if not jobs:
+        return 0, [], 0
+
+    blocks = target.data.shape_keys.key_blocks
+    prev_active = context.view_layer.objects.active
+    prev_mode = target.mode
+    created = []
+    placed = 0
+    ungrouped = 0
+
+    def _dest_before_next_divider(anchor_name, moving_name):
+        anchor_i = blocks.find(anchor_name)
+        if anchor_i < 0:
+            return None
+        cur = blocks.find(moving_name)
+        if cur < 0:
+            return None
+        d = _next_divider_index(blocks, anchor_i + 1)
+        n = len(blocks)
+        if d >= n:
+            return n - 1
+        return d if cur > d else d - 1
+
+    try:
+        with context.temp_override(
+            active_object=target, object=target,
+            selected_objects=[target], selected_editable_objects=[target],
+        ):
+            if target.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+
+            for name, top_div, sub_div in jobs:
+                top_existed = (top_div is None) or (blocks.find(top_div) >= 0)
+                sub_existed = (sub_div is None) or (blocks.find(sub_div) >= 0)
+
+                if not create_missing and (not top_existed or not sub_existed):
+                    ungrouped += 1
+                    continue
+
+                if top_div is not None and not top_existed:
+                    _create_divider_key(target, top_div)
+                    created.append(top_div)
+                if sub_div is not None and not sub_existed:
+                    _create_divider_key(target, sub_div)
+                    created.append(sub_div)
+                    # A sub created under a PRE-EXISTING top must be moved into
+                    # that top's group (new top+sub pairs are already adjacent
+                    # at the end, so they need no move).
+                    if top_div is not None and top_existed:
+                        dest = _dest_before_next_divider(top_div, sub_div)
+                        if dest is not None:
+                            _move_key_to_index(target, sub_div, dest)
+
+                anchor = sub_div or top_div
+                key_i = blocks.find(name)
+                if key_i >= 0 and _current_anchor_name(blocks, key_i) == anchor:
+                    # Already sitting under the right divider (e.g. it was
+                    # copied in reference order alongside its divider, or the
+                    # sub-divider move above already carried it into place).
+                    placed += 1
+                    continue
+                dest = _dest_before_next_divider(anchor, name)
+                if dest is not None:
+                    _move_key_to_index(target, name, dest)
+                    placed += 1
+                else:
+                    ungrouped += 1
+    except Exception as err:  # noqa: BLE001 - placement is best-effort
+        print(f"[Dalek's Shapekey Manager] group placement error: {err}")
+    finally:
+        if prev_active is not None:
+            context.view_layer.objects.active = prev_active
+        if target.mode != prev_mode:
+            try:
+                with context.temp_override(active_object=target, object=target):
+                    bpy.ops.object.mode_set(mode=prev_mode)
+            except RuntimeError as err:
+                print(f"[Dalek's Shapekey Manager] mode restore failed: {err}")
+    return placed, created, ungrouped
+
+
 def _sync_delete_target_keys(context, target, names):
     """Remove the named shape keys from target. Uses `temp_override` +
     `bpy.ops.object.shape_key_remove` so undo and depsgraph updates fire
@@ -736,15 +935,25 @@ class SKP_OT_SyncCopyMissing(_CooldownMixin, Operator):
         # in this batch but inserted after the dependent key.
         _sync_fixup_relative_keys(reference, target, touched)
 
+        group_note = ""
+        if props.sync_match_groups and touched:
+            placed, created, _ung = _apply_group_placement(
+                context, reference, target, touched, props.sync_create_groups)
+            if placed:
+                group_note = f" Grouped {placed}"
+                if created:
+                    group_note += f", created {len(created)} group(s)"
+                group_note += "."
+
         if failed:
             self.report(
                 {'WARNING'},
                 f"Copied {added} shape key(s) into '{target.name}'; {failed} "
-                f"failed (vertex-count mismatch?).",
+                f"failed (vertex-count mismatch?).{group_note}",
             )
         else:
             self.report({'INFO'},
-                        f"Copied {added} shape key(s) into '{target.name}'.")
+                        f"Copied {added} shape key(s) into '{target.name}'.{group_note}")
         SKP_OT_SyncCopyMissing._keys_to_copy = []
         context.scene.skp_delete_preview.clear()
         return {'FINISHED'}
@@ -830,12 +1039,47 @@ class SKP_OT_SyncCopyMissing(_CooldownMixin, Operator):
 
 class SKP_OT_SyncCopyOne(Operator):
     """Copy a single shape key from the Reference mesh into the Target mesh.
-    Always replaces the key on the Target if it already exists."""
+    Always replaces the key on the Target if it already exists. With 'Match
+    Groups' on, the key is placed under its category divider - and if that
+    group is missing on the Target you're asked whether to create it."""
     bl_idname = "skp.sync_copy_one"
     bl_label = "Copy Shape Key to Target"
     bl_options = {'REGISTER', 'UNDO'}
 
     key_name: StringProperty()
+    create_group: BoolProperty(
+        name="Create the missing group(s)",
+        default=True,
+        options={'SKIP_SAVE'},
+    )
+
+    def invoke(self, context, event):
+        props = context.scene.skp_props
+        reference = props.sync_reference
+        target = props.sync_target
+        self._asked = False
+        ok, _msg = _sync_validate(reference, target, require_same_vcount=True)
+        if ok and props.sync_match_groups:
+            self._missing = _missing_group_dividers(
+                reference, target, [self.key_name])
+            if self._missing:
+                self._asked = True
+                return context.window_manager.invoke_props_dialog(self, width=340)
+        return self.execute(context)
+
+    def draw(self, context):
+        layout = self.layout
+        missing = getattr(self, "_missing", [])
+        col = layout.column(align=True)
+        col.label(text=f"'{self.key_name}' belongs to a group not on the Target:",
+                  icon='QUESTION')
+        for div in missing:
+            col.label(text=f"    {category_label(div)}", icon='OUTLINER_COLLECTION')
+        layout.separator(factor=0.3)
+        layout.prop(self, "create_group")
+        hint = layout.row()
+        hint.enabled = False
+        hint.label(text="Off: the key is copied but left ungrouped.", icon='INFO')
 
     def execute(self, context):
         props = context.scene.skp_props
@@ -848,15 +1092,25 @@ class SKP_OT_SyncCopyOne(Operator):
 
         result = _sync_copy_key(reference, target, self.key_name,
                                 replace_existing=True)
-        if result == 'added':
-            self.report({'INFO'}, f"Added '{self.key_name}' to '{target.name}'.")
-        elif result == 'replaced':
-            self.report({'INFO'},
-                        f"Replaced '{self.key_name}' on '{target.name}'.")
-        else:
+        if result not in ('added', 'replaced'):
             self.report({'WARNING'},
                         f"Could not copy '{self.key_name}' ({result}).")
             return {'CANCELLED'}
+
+        verb = "Added" if result == 'added' else "Replaced"
+        group_note = ""
+        if props.sync_match_groups:
+            # If we popped the dialog, honour its toggle; otherwise fall back to
+            # the panel's standing preference.
+            create = (self.create_group if getattr(self, "_asked", False)
+                      else props.sync_create_groups)
+            placed, created, _ung = _apply_group_placement(
+                context, reference, target, [self.key_name], create)
+            if placed:
+                group_note = (f" Placed in '{category_label(created[-1])}'."
+                              if created else " Placed in its group.")
+        self.report({'INFO'},
+                    f"{verb} '{self.key_name}' on '{target.name}'.{group_note}")
         return {'FINISHED'}
 
 
@@ -941,6 +1195,12 @@ class SKP_OT_SyncCopyFiltered(_CooldownMixin, Operator):
 
         _sync_fixup_relative_keys(reference, target, touched)
 
+        if props.sync_match_groups and touched:
+            placed, created, _ung = _apply_group_placement(
+                context, reference, target, touched, props.sync_create_groups)
+        else:
+            placed, created = 0, []
+
         parts = []
         if added:
             parts.append(f"{added} added")
@@ -948,6 +1208,9 @@ class SKP_OT_SyncCopyFiltered(_CooldownMixin, Operator):
             parts.append(f"{replaced} replaced")
         if failed:
             parts.append(f"{failed} failed")
+        if placed:
+            parts.append(f"{placed} grouped"
+                         + (f" (+{len(created)} new group(s))" if created else ""))
         summary = ", ".join(parts) if parts else "nothing copied"
         self.report({'WARNING'} if failed else {'INFO'}, f"Transfer: {summary}.")
 
@@ -1517,6 +1780,12 @@ class SKP_PT_SyncPanel(Panel):
         row.prop(props, "sync_skip_existing", toggle=True)
         row.prop(props, "sync_show_only_missing", toggle=True)
 
+        row = filter_box.row(align=True)
+        row.prop(props, "sync_match_groups", toggle=True, icon='OUTLINER_COLLECTION')
+        cg = row.row(align=True)
+        cg.enabled = props.sync_match_groups
+        cg.prop(props, "sync_create_groups", toggle=True)
+
         # Compute the visible set once for status, pagination, and rendering
         visible = get_sync_filtered_keys(reference, target, props)
         n_visible = len(visible)
@@ -1634,6 +1903,16 @@ class SKP_PT_SyncPanel(Panel):
                         "skp.sync_copy_one", text="", icon='IMPORT',
                     )
                     cop.key_name = kb.name
+
+        # Bottom pager mirrors the top one so paging doesn't require scrolling
+        # back up past a long key list.
+        if num_pages > 1:
+            pager = layout.row(align=True)
+            pager.operator("skp.sync_page_first", text="", icon='REW')
+            pager.operator("skp.sync_page_prev",  text="", icon='TRIA_LEFT')
+            pager.label(text=f"Page {current_page + 1} / {num_pages}")
+            pager.operator("skp.sync_page_next",  text="", icon='TRIA_RIGHT')
+            pager.operator("skp.sync_page_last",  text="", icon='FF')
 
         # --- Bulk action row ---
         layout.separator(factor=0.4)
