@@ -18,7 +18,7 @@ divider is detected, letting you filter the list to a single category.
 # on every release. Blender 4.2+ extensions may strip bl_info from the
 # runtime module namespace, so other code paths (e.g. the debug dump)
 # read _ADDON_VERSION directly.
-_ADDON_VERSION = (1, 10, 4)
+_ADDON_VERSION = (1, 10, 5)
 
 bl_info = {
     "name": "Dalek's Shapekey Manager",
@@ -595,8 +595,10 @@ def _sync_reference_file_update(self, context):
 
 
 def _sync_reference_mode_update(self, context):
-    """Entering 'From .blend file' mode with no file yet: offer the last file
-    remembered in preferences as the default."""
+    """Switching reference source invalidates any running preview, so forget
+    the active-preview marker. Also, entering 'From .blend file' mode with no
+    file yet offers the last file remembered in preferences as the default."""
+    self.sync_preview_active = ""
     if self.sync_reference_mode == 'FILE' and not self.sync_reference_file:
         last = _get_remembered_reference_file()
         if last:
@@ -728,7 +730,7 @@ class SKP_Properties(PropertyGroup):
              "It is loaded into a hidden temporary slot and never saved into "
              "your working file"),
         ],
-        default='SCENE',
+        default='FILE',
         update=_sync_reference_mode_update,
     )
 
@@ -744,6 +746,15 @@ class SKP_Properties(PropertyGroup):
         name="Reference Mesh",
         description="Which object inside the .blend file to use as the Reference",
         items=_sync_reference_object_items,
+    )
+
+    # Name of the Reference key currently being previewed, so the per-row play
+    # button can render as a stop button. Authoritative only in scene mode; in
+    # file mode the live preview key on the Target is the source of truth.
+    sync_preview_active: StringProperty(
+        name="Active Preview Key",
+        default="",
+        options={'SKIP_SAVE'},
     )
 
     sync_target: PointerProperty(

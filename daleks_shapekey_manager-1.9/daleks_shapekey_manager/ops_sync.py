@@ -72,6 +72,7 @@ def _skp_purge_temp_reference(context=None):
         ref = props.sync_reference
         if ref is not None and ref.get(_SKP_TEMP_REF_TAG):
             props.sync_reference = None
+        props.sync_preview_active = ""
 
     # Any temporary preview keys we dropped on a Target only make sense while a
     # file-mode Reference is loaded, so tear them down here too. This is what
@@ -161,6 +162,48 @@ def _skp_preview_on_target(reference, target, name, value, auto_reset):
     prev_kb.value = value
     target.active_shape_key_index = tgt_sk.key_blocks.find(prev_kb.name)
     return True, ""
+
+
+def _target_preview_key_name(target):
+    """The Reference key currently previewed on `target` (from its temp preview
+    key's name), or "" if none."""
+    if target is None or target.data is None or target.data.shape_keys is None:
+        return ""
+    pref = _SKP_PREVIEW_PREFIX + " "
+    for kb in target.data.shape_keys.key_blocks:
+        if kb.name.startswith(pref):
+            return kb.name[len(pref):]
+    return ""
+
+
+def _active_preview_name(props):
+    """Name of the Reference key currently being previewed, for the play/stop
+    toggle. In file mode this is authoritative (read from the Target's preview
+    key); in scene mode it's the last-previewed name we recorded."""
+    if props.sync_reference_mode == 'FILE':
+        return _target_preview_key_name(props.sync_target)
+    return props.sync_preview_active or ""
+
+
+def _reset_sync_preview(context, props):
+    """Tear down any active preview: remove temp preview keys and zero the
+    Reference (and, in file mode, Target) sliders. Returns previews removed."""
+    cleared = _skp_clear_all_previews()
+
+    def _zero(obj):
+        if obj is None or obj.data is None or obj.data.shape_keys is None:
+            return
+        sk = obj.data.shape_keys
+        basis_name = sk.reference_key.name if sk.reference_key else "Basis"
+        for kb in sk.key_blocks:
+            if kb.name != basis_name and not is_category_divider(kb.name):
+                kb.value = 0.0
+
+    _zero(props.sync_reference)
+    if props.sync_reference_mode == 'FILE':
+        _zero(props.sync_target)
+    props.sync_preview_active = ""
+    return cleared
 
 
 def _skp_load_temp_reference(props):
@@ -1317,13 +1360,15 @@ class SKP_OT_SyncCopyFiltered(_CooldownMixin, Operator):
 
 
 class SKP_OT_SyncPreviewKey(Operator):
-    """Preview a Reference shape key. In scene mode this drives the slider on
-    the Reference mesh itself. In 'From .blend file' mode the Reference is
-    invisible, so the key is temporarily copied onto the Target so you can see
-    it on your model (removed automatically on Reset / Release / save).
-    Respects Auto Reset and Preview Value; shift-click keeps other sliders."""
+    """Preview a Reference shape key, or stop previewing it. Click the play
+    button to preview; it turns into a stop button - click it again to stop.
+    In scene mode this drives the slider on the Reference mesh itself. In
+    'From .blend file' mode the Reference is invisible, so the key is
+    temporarily copied onto the Target so you can see it on your model
+    (removed on stop / Reset / Release / save). Respects Auto Reset and
+    Preview Value; shift-click previews while keeping other sliders."""
     bl_idname = "skp.sync_preview_key"
-    bl_label = "Preview Reference Shape Key"
+    bl_label = "Preview / Stop Reference Shape Key"
     bl_options = {'REGISTER', 'UNDO'}
 
     key_name: StringProperty()
@@ -1343,6 +1388,12 @@ class SKP_OT_SyncPreviewKey(Operator):
             self.report({'WARNING'}, "Cannot preview a category divider.")
             return {'CANCELLED'}
 
+        # Toggle: a plain click on the key that's already previewing stops it.
+        if not self.extend and _active_preview_name(props) == self.key_name:
+            _reset_sync_preview(context, props)
+            self.report({'INFO'}, f"Stopped previewing '{self.key_name}'.")
+            return {'FINISHED'}
+
         auto_reset = props.auto_reset and not self.extend
 
         # File-mode Reference is off-screen; preview onto the Target instead.
@@ -1358,6 +1409,7 @@ class SKP_OT_SyncPreviewKey(Operator):
             if not ok:
                 self.report({'WARNING'}, msg)
                 return {'CANCELLED'}
+            props.sync_preview_active = self.key_name
             return {'FINISHED'}
 
         ok = _sync_preview_one(
@@ -1367,6 +1419,7 @@ class SKP_OT_SyncPreviewKey(Operator):
             self.report({'WARNING'},
                         f"Could not preview '{self.key_name}' on reference.")
             return {'CANCELLED'}
+        props.sync_preview_active = self.key_name
         return {'FINISHED'}
 
 
@@ -1380,25 +1433,8 @@ class SKP_OT_SyncResetReference(Operator):
 
     def execute(self, context):
         props = context.scene.skp_props
-
-        # Tear down any temporary on-Target preview key first.
-        cleared = _skp_clear_all_previews()
-
-        def _zero(obj):
-            if obj is None or obj.data is None or obj.data.shape_keys is None:
-                return
-            sk = obj.data.shape_keys
-            basis_name = sk.reference_key.name if sk.reference_key else "Basis"
-            for kb in sk.key_blocks:
-                if kb.name != basis_name and not is_category_divider(kb.name):
-                    kb.value = 0.0
-
-        reference = props.sync_reference
-        _zero(reference)
-        if props.sync_reference_mode == 'FILE':
-            _zero(props.sync_target)
-
-        if reference is None and not cleared:
+        cleared = _reset_sync_preview(context, props)
+        if props.sync_reference is None and not cleared:
             self.report({'WARNING'}, "Nothing to reset.")
             return {'CANCELLED'}
         self.report({'INFO'}, "Reset preview.")
@@ -1791,6 +1827,9 @@ class SKP_PT_SyncPanel(Panel):
         n_visible = len(visible)
         tgt_names = _shape_key_names(target, exclude_basis=False)
 
+        # Which key is currently being previewed (its play button shows a stop).
+        active_preview = _active_preview_name(props)
+
         # Visible breakdown (informational)
         v_missing = sum(1 for _i, kb in visible if kb.name not in tgt_names)
         v_existing = n_visible - v_missing
@@ -1888,12 +1927,18 @@ class SKP_PT_SyncPanel(Panel):
                 if not is_category_divider(kb.name):
                     # File-mode preview copies onto the Target, so it needs a
                     # matching vertex count just like Copy does.
+                    is_previewing = (kb.name == active_preview)
                     prev_btn = row.row()
+                    # Keep the stop button clickable even if something else
+                    # would disable it, so a preview can always be stopped.
                     prev_btn.enabled = (
-                        props.sync_reference_mode != 'FILE' or vcount_ok
+                        is_previewing
+                        or props.sync_reference_mode != 'FILE'
+                        or vcount_ok
                     )
                     prev_op = prev_btn.operator(
-                        "skp.sync_preview_key", text="", icon='PLAY',
+                        "skp.sync_preview_key", text="",
+                        icon='PAUSE' if is_previewing else 'PLAY',
                     )
                     prev_op.key_name = kb.name
 
