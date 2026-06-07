@@ -18,7 +18,7 @@ divider is detected, letting you filter the list to a single category.
 # on every release. Blender 4.2+ extensions may strip bl_info from the
 # runtime module namespace, so other code paths (e.g. the debug dump)
 # read _ADDON_VERSION directly.
-_ADDON_VERSION = (1, 9, 0)
+_ADDON_VERSION = (1, 10, 1)
 
 bl_info = {
     "name": "Dalek's Shapekey Manager",
@@ -34,6 +34,7 @@ bl_info = {
 def _addon_version_tuple():
     return _ADDON_VERSION
 
+import os
 import re
 import time
 import hashlib
@@ -105,6 +106,16 @@ class SKP_AddonPreferences(bpy.types.AddonPreferences):
         min=0.0,
         max=30.0,
         step=50,
+    )
+
+    # Last external .blend picked in the Transfer panel's "From .blend file"
+    # mode. Lives in preferences (not the scene) so it persists across files
+    # and sessions and is offered as the default next time.
+    last_reference_file: StringProperty(
+        name="Last Reference File",
+        description="Most recent external .blend used as a Transfer Reference",
+        subtype='FILE_PATH',
+        default="",
     )
 
     def draw(self, context):
@@ -467,6 +478,149 @@ def _update_preview_value(self, context):
     kb.value = self.preview_value
 
 
+# -----------------------------------------
+#  External-file Reference (Transfer "From .blend file" mode)
+# -----------------------------------------
+#
+# These power the Transfer panel's "From .blend file" mode, where the
+# Reference mesh is pulled from an external .blend on demand instead of
+# having to be present in the current scene. We scan the picked file for
+# object names (cached by path+mtime) and expose them as a dropdown; the
+# actual temporary append + cleanup lives in ops_sync.
+
+# Sentinel enum id used when no file is picked / no objects are found.
+_SKP_REF_NONE = '__SKP_NONE__'
+
+# abspath -> (mtime, [object_name, ...])
+_blend_object_scan_cache = {}
+# Keep the last enum item tuples alive per file. Blender's EnumProperty
+# items callback MUST retain references to the returned strings or they can
+# be garbage-collected mid-use, corrupting the dropdown.
+_blend_enum_items_cache = {}
+
+
+def _scan_blend_objects(filepath):
+    """Return a list of object names found in an external .blend, cached by
+    (abspath, mtime). Returns [] on any error or empty path.
+
+    Only object *names* are available from the library header without fully
+    loading; type/vertex-count validation happens at append time instead."""
+    if not filepath:
+        return []
+    try:
+        abspath = bpy.path.abspath(filepath)
+    except Exception:
+        return []
+    if not os.path.isfile(abspath):
+        return []
+    try:
+        mtime = os.path.getmtime(abspath)
+    except OSError:
+        return []
+    cached = _blend_object_scan_cache.get(abspath)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        with bpy.data.libraries.load(abspath, link=False) as (data_from, _data_to):
+            names = list(data_from.objects)
+    except Exception:
+        return []
+    _blend_object_scan_cache[abspath] = (mtime, names)
+    return names
+
+
+def _reference_file_missing(filepath):
+    """True if a non-empty path points at something that isn't a real file."""
+    if not filepath:
+        return False
+    try:
+        return not os.path.isfile(bpy.path.abspath(filepath))
+    except Exception:
+        return True
+
+
+def _match_object_name(names, target):
+    """Return the entry in `names` matching target's name (exact first, then
+    case-insensitive), or None if there's no match / no target."""
+    if target is None:
+        return None
+    if target.name in names:
+        return target.name
+    low = target.name.lower()
+    return next((n for n in names if n.lower() == low), None)
+
+
+def _remember_reference_file(filepath):
+    """Persist the last-picked Reference .blend into addon preferences so it
+    survives across files and sessions."""
+    if not filepath:
+        return
+    addon = bpy.context.preferences.addons.get(__name__)
+    if addon is not None:
+        addon.preferences.last_reference_file = filepath
+
+
+def _get_remembered_reference_file():
+    addon = bpy.context.preferences.addons.get(__name__)
+    return addon.preferences.last_reference_file if addon is not None else ""
+
+
+def _sync_reference_object_items(self, context):
+    """Dynamic enum: object names inside the picked .blend file."""
+    names = _scan_blend_objects(self.sync_reference_file)
+    if not names:
+        items = [(_SKP_REF_NONE, "(pick a .blend file)",
+                  "No objects found - choose a valid .blend file above")]
+    else:
+        items = [(n, n, f"Use object '{n}' from the file as the Reference")
+                 for n in names]
+    _blend_enum_items_cache[self.sync_reference_file or ""] = items
+    return items
+
+
+def _sync_reference_file_update(self, context):
+    """When the .blend path changes, remember it in preferences and default
+    the object selection to the one whose name matches the Target mesh (the
+    hybrid auto-pick), else the first object. Falls back silently if nothing
+    usable is found."""
+    _remember_reference_file(self.sync_reference_file)
+    names = _scan_blend_objects(self.sync_reference_file)
+    if not names:
+        return
+    chosen = _match_object_name(names, self.sync_target) or names[0]
+    try:
+        self.sync_reference_object = chosen
+    except TypeError:
+        pass
+
+
+def _sync_reference_mode_update(self, context):
+    """Entering 'From .blend file' mode with no file yet: offer the last file
+    remembered in preferences as the default."""
+    if self.sync_reference_mode == 'FILE' and not self.sync_reference_file:
+        last = _get_remembered_reference_file()
+        if last:
+            self.sync_reference_file = last  # triggers the file update cb
+
+
+def _sync_target_update(self, context):
+    """When the Target changes in file mode, try to re-point the Reference
+    object dropdown at the same-named mesh in the external file. If there's no
+    name match, leave the current selection untouched - no error."""
+    if self.sync_reference_mode != 'FILE':
+        return
+    names = _scan_blend_objects(self.sync_reference_file)
+    if not names:
+        return
+    match = _match_object_name(names, self.sync_target)
+    if match is None:
+        return
+    try:
+        self.sync_reference_object = match
+    except TypeError:
+        pass
+
+
 class SKP_Properties(PropertyGroup):
 
     search_filter: StringProperty(
@@ -563,6 +717,35 @@ class SKP_Properties(PropertyGroup):
         poll=lambda self, obj: obj.type == 'MESH',
     )
 
+    sync_reference_mode: EnumProperty(
+        name="Reference Source",
+        description="Where the Reference mesh comes from",
+        items=[
+            ('SCENE', "In Scene",
+             "Pick a Reference mesh that is already present in this file"),
+            ('FILE', "From .blend File",
+             "Pull the Reference mesh from an external .blend file on demand. "
+             "It is loaded into a hidden temporary slot and never saved into "
+             "your working file"),
+        ],
+        default='SCENE',
+        update=_sync_reference_mode_update,
+    )
+
+    sync_reference_file: StringProperty(
+        name="Reference File",
+        description="External .blend file to pull the Reference mesh from",
+        subtype='FILE_PATH',
+        default="",
+        update=_sync_reference_file_update,
+    )
+
+    sync_reference_object: EnumProperty(
+        name="Reference Mesh",
+        description="Which object inside the .blend file to use as the Reference",
+        items=_sync_reference_object_items,
+    )
+
     sync_target: PointerProperty(
         type=bpy.types.Object,
         name="Target",
@@ -572,6 +755,7 @@ class SKP_Properties(PropertyGroup):
             "written into this mesh (the write target)"
         ),
         poll=lambda self, obj: obj.type == 'MESH',
+        update=_sync_target_update,
     )
 
     sync_filter: StringProperty(
@@ -3489,9 +3673,34 @@ def register():
     if addon:
         _ensure_default_patterns(addon.preferences)
 
+    # Handlers that keep the Transfer "From .blend file" temp Reference out of
+    # saved files (save_pre) but restore it for the live session (save_post),
+    # and clean up any stray temp object on file open (load_post).
+    for handler, fn in (
+        (bpy.app.handlers.save_pre,   ops_sync._skp_save_pre_handler),
+        (bpy.app.handlers.save_post,  ops_sync._skp_save_post_handler),
+        (bpy.app.handlers.load_post,  ops_sync._skp_load_post_handler),
+    ):
+        if fn not in handler:
+            handler.append(fn)
+
 
 def unregister():
     SKP_OT_ArrowKeyModal._running = False
+
+    # Remove our app handlers and clean up any temp Reference left behind.
+    for handler, fn in (
+        (bpy.app.handlers.save_pre,   ops_sync._skp_save_pre_handler),
+        (bpy.app.handlers.save_post,  ops_sync._skp_save_post_handler),
+        (bpy.app.handlers.load_post,  ops_sync._skp_load_post_handler),
+    ):
+        if fn in handler:
+            handler.remove(fn)
+    try:
+        ops_sync._skp_purge_temp_reference()
+    except Exception:
+        pass
+
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.skp_props

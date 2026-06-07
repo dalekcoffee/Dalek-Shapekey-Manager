@@ -18,10 +18,12 @@ and any scripts that drive these operators. Only the user-visible labels
 were renamed to "Transfer" in v1.1.9.
 """
 
+import os
 import time
 
 import bpy
 import numpy as np
+from bpy.app.handlers import persistent
 from bpy.props import (
     BoolProperty,
     EnumProperty,
@@ -32,13 +34,130 @@ from bpy.types import Operator, Panel
 
 from . import (
     _CooldownMixin,
+    _SKP_REF_NONE,
     _decode_category_filter,
     _get_cache,
+    _reference_file_missing,
     _shape_key_names,
     get_sync_filtered_keys,
     is_category_divider,
     total_pages,
 )
+
+# Custom-property tag stamped on temp Reference objects appended from an
+# external .blend so they can be reliably found and purged later.
+_SKP_TEMP_REF_TAG = "__skp_temp_ref__"
+
+
+# -----------------------------------------
+#  External-file Reference: load / purge
+# -----------------------------------------
+
+def _skp_purge_temp_reference(context=None):
+    """Remove every temp Reference object previously appended for file-mode,
+    plus their now-orphaned mesh data. Detaches any sync_reference pointer
+    first. Safe to call anytime; returns the number of objects removed."""
+    # Drop pointers so we don't leave a dangling reference behind.
+    for scene in bpy.data.scenes:
+        props = getattr(scene, "skp_props", None)
+        if props is None:
+            continue
+        ref = props.sync_reference
+        if ref is not None and ref.get(_SKP_TEMP_REF_TAG):
+            props.sync_reference = None
+
+    removed = 0
+    for obj in list(bpy.data.objects):
+        if not obj.get(_SKP_TEMP_REF_TAG):
+            continue
+        mesh = obj.data if obj.type == 'MESH' else None
+        for coll in list(obj.users_collection):
+            coll.objects.unlink(obj)
+        bpy.data.objects.remove(obj, do_unlink=True)
+        removed += 1
+        if mesh is not None and mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+    return removed
+
+
+def _skp_load_temp_reference(props):
+    """Append props.sync_reference_object from props.sync_reference_file as a
+    hidden, tagged temp Reference and assign it to props.sync_reference.
+
+    Returns (obj, None) on success or (None, error_message) on failure. Any
+    existing temp Reference is purged first. The appended object is NOT linked
+    into a collection (so it stays invisible and clutter-free); raw shape-key
+    and vertex data are still fully readable."""
+    raw = props.sync_reference_file or ""
+    filepath = bpy.path.abspath(raw)
+    obj_name = props.sync_reference_object
+
+    if not raw:
+        return None, "Pick a .blend file first."
+    if not os.path.isfile(filepath):
+        return None, f"File not found: {raw}"
+    if not obj_name or obj_name == _SKP_REF_NONE:
+        return None, "Pick an object from the file."
+
+    _skp_purge_temp_reference()
+
+    try:
+        with bpy.data.libraries.load(filepath, link=False) as (data_from, data_to):
+            if obj_name not in data_from.objects:
+                return None, f"'{obj_name}' not found in file."
+            data_to.objects = [obj_name]
+    except Exception as exc:  # noqa: BLE001 - surface any loader failure
+        return None, f"Failed to load: {exc}"
+
+    appended = [o for o in data_to.objects if o is not None]
+    if not appended:
+        return None, "Object could not be appended."
+    obj = appended[0]
+
+    if obj.type != 'MESH' or obj.data is None:
+        bpy.data.objects.remove(obj, do_unlink=True)
+        return None, f"'{obj_name}' is not a usable mesh."
+    if obj.data.shape_keys is None:
+        mesh = obj.data
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+        return None, f"'{obj_name}' has no shape keys."
+
+    obj[_SKP_TEMP_REF_TAG] = True
+    obj.name = f"[SKP TempRef] {obj_name}"
+    props.sync_reference = obj
+    return obj, None
+
+
+@persistent
+def _skp_save_pre_handler(_dummy):
+    """Strip the temp Reference before the file is written so it never gets
+    saved into the user's working file."""
+    _skp_purge_temp_reference()
+
+
+@persistent
+def _skp_save_post_handler(_dummy):
+    """Re-append the temp Reference after a save so the live session is
+    uninterrupted (it was removed by the save_pre handler)."""
+    for scene in bpy.data.scenes:
+        props = getattr(scene, "skp_props", None)
+        if props is None:
+            continue
+        if (getattr(props, "sync_reference_mode", 'SCENE') == 'FILE'
+                and props.sync_reference_file
+                and props.sync_reference_object
+                and props.sync_reference_object != _SKP_REF_NONE):
+            _skp_load_temp_reference(props)  # best-effort; ignore errors
+            break
+
+
+@persistent
+def _skp_load_post_handler(_dummy):
+    """Purge any stray temp Reference that somehow survived into a freshly
+    opened file (defensive; save_pre should have prevented it)."""
+    _skp_purge_temp_reference()
 
 
 def _sync_copy_key(reference, target, name, *, replace_existing):
@@ -1045,6 +1164,46 @@ class SKP_OT_SyncStatusInfo(Operator):
         return {'FINISHED'}
 
 
+class SKP_OT_SyncLoadReference(Operator):
+    """Append the chosen mesh from the external .blend file as a temporary,
+    hidden Reference. Run it again to refresh from disk after editing the
+    source file. The temp Reference is never written into your working file."""
+    bl_idname = "skp.sync_load_reference"
+    bl_label = "Load / Refresh Reference from File"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.skp_props
+        obj, err = _skp_load_temp_reference(props)
+        if err:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
+        n_keys = len(obj.data.shape_keys.key_blocks)
+        n_verts = len(obj.data.vertices)
+        self.report(
+            {'INFO'},
+            f"Loaded '{props.sync_reference_object}': {n_keys} key(s), "
+            f"{n_verts} verts (temporary).",
+        )
+        return {'FINISHED'}
+
+
+class SKP_OT_SyncReleaseReference(Operator):
+    """Remove the temporary file-loaded Reference and free its data."""
+    bl_idname = "skp.sync_release_reference"
+    bl_label = "Release Reference"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        n = _skp_purge_temp_reference(context)
+        self.report(
+            {'INFO'},
+            "Released temporary Reference." if n
+            else "No temporary Reference was loaded.",
+        )
+        return {'FINISHED'}
+
+
 # -----------------------------------------
 #  Sync panel + presets sub-panel
 # -----------------------------------------
@@ -1080,12 +1239,55 @@ class SKP_PT_SyncPanel(Panel):
         box = layout.box()
         col = box.column(align=True)
 
-        row = col.row(align=True)
-        row.prop(props, "sync_reference", text="Reference")
-        focus_ref = row.operator(
-            "skp.sync_focus_mesh", text="", icon='ZOOM_SELECTED',
-        )
-        focus_ref.mesh_role = 'reference'
+        mode_row = col.row(align=True)
+        mode_row.prop(props, "sync_reference_mode", expand=True)
+
+        if props.sync_reference_mode == 'SCENE':
+            row = col.row(align=True)
+            row.prop(props, "sync_reference", text="Reference")
+            focus_ref = row.operator(
+                "skp.sync_focus_mesh", text="", icon='ZOOM_SELECTED',
+            )
+            focus_ref.mesh_role = 'reference'
+        else:
+            # --- From .blend file ---
+            col.prop(props, "sync_reference_file", text="File")
+            has_file = bool(props.sync_reference_file)
+            file_missing = _reference_file_missing(props.sync_reference_file)
+
+            if file_missing:
+                err = col.row()
+                err.alert = True
+                err.label(text="File not found - check the path.", icon='ERROR')
+
+            file_ok = has_file and not file_missing
+
+            obj_row = col.row(align=True)
+            obj_row.enabled = file_ok
+            obj_row.prop(props, "sync_reference_object", text="Mesh")
+
+            load_row = col.row(align=True)
+            load_row.enabled = file_ok
+            load_row.operator(
+                "skp.sync_load_reference", text="Load / Refresh", icon='IMPORT',
+            )
+            ref = props.sync_reference
+            is_loaded = ref is not None and ref.get("__skp_temp_ref__")
+            if is_loaded:
+                load_row.operator(
+                    "skp.sync_release_reference", text="", icon='X',
+                )
+                status = col.row()
+                status.label(
+                    text=f"Loaded: {props.sync_reference_object} (temporary)",
+                    icon='CHECKMARK',
+                )
+            elif file_ok:
+                status = col.row()
+                status.enabled = False
+                status.label(
+                    text="Not loaded - click Load / Refresh.", icon='INFO',
+                )
 
         row = col.row(align=True)
         row.prop(props, "sync_target", text="Target")
@@ -1446,6 +1648,8 @@ CLASSES = (
     SKP_OT_SyncPageLast,
     SKP_OT_SyncFocusMesh,
     SKP_OT_SyncStatusInfo,
+    SKP_OT_SyncLoadReference,
+    SKP_OT_SyncReleaseReference,
     SKP_PT_SyncPanel,
     SKP_PT_SyncPresets,
 )
