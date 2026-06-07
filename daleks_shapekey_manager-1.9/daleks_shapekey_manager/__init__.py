@@ -18,7 +18,7 @@ divider is detected, letting you filter the list to a single category.
 # on every release. Blender 4.2+ extensions may strip bl_info from the
 # runtime module namespace, so other code paths (e.g. the debug dump)
 # read _ADDON_VERSION directly.
-_ADDON_VERSION = (1, 10, 1)
+_ADDON_VERSION = (1, 10, 2)
 
 bl_info = {
     "name": "Dalek's Shapekey Manager",
@@ -1195,22 +1195,55 @@ class SKP_OT_ApplyKey(Operator):
             self.report({'WARNING'}, msg)
             return {'CANCELLED'}
 
-        blocks = obj.data.shape_keys.key_blocks
+        sk = obj.data.shape_keys
+        blocks = sk.key_blocks
         idx = blocks.find(self.key_name)
         if idx < 0:
             self.report({'WARNING'}, f"Shape key '{self.key_name}' not found.")
             return {'CANCELLED'}
 
-        # Set as active then use Blender's built-in apply. Wrap so that
-        # if a future Blender release renames/removes apply_mix the user
-        # sees the error instead of a silent no-op.
+        key = blocks[idx]
+        value = key.value
+
+        # Bake this key's deformation at its CURRENT value into the mesh, then
+        # remove the key. We can't use Blender's shape_key_remove(apply_mix=True)
+        # for this: apply_mix only bakes when all=True, so for a single key it
+        # silently removed the key WITHOUT baking - i.e. the key was effectively
+        # applied at value 0 regardless of its slider (the reported bug).
+        #
+        # Do the delta math ourselves. The key's contribution at vertex i is
+        # value * (key_co - relative_key_co). We push that delta into the Basis
+        # (and the base mesh), and add the same delta to every OTHER remaining
+        # key so their visual effect relative to the new Basis is unchanged.
+        relkey = key.relative_key or sk.reference_key
+        nverts = len(obj.data.vertices)
+        kco = np.empty(nverts * 3, dtype=np.float32)
+        rco = np.empty(nverts * 3, dtype=np.float32)
+        key.data.foreach_get("co", kco)
+        relkey.data.foreach_get("co", rco)
+        delta = value * (kco - rco)
+
+        if delta.any():
+            buf = np.empty(nverts * 3, dtype=np.float32)
+            for kb in blocks:
+                if kb == key:
+                    continue
+                kb.data.foreach_get("co", buf)
+                kb.data.foreach_set("co", buf + delta)
+            obj.data.vertices.foreach_get("co", buf)
+            obj.data.vertices.foreach_set("co", buf + delta)
+            obj.data.update()
+
         obj.active_shape_key_index = idx
         try:
-            bpy.ops.object.shape_key_remove(all=False, apply_mix=True)
+            bpy.ops.object.shape_key_remove(all=False, apply_mix=False)
         except RuntimeError as err:
             self.report({'ERROR'}, f"Apply failed: {err}")
             return {'CANCELLED'}
-        self.report({'INFO'}, f"Applied shape key: {self.key_name}")
+        self.report(
+            {'INFO'},
+            f"Applied shape key '{self.key_name}' at value {value:.3f}.",
+        )
         return {'FINISHED'}
 
     def invoke(self, context, event):
