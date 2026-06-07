@@ -48,6 +48,11 @@ from . import (
 # external .blend so they can be reliably found and purged later.
 _SKP_TEMP_REF_TAG = "__skp_temp_ref__"
 
+# Name prefix for the throwaway shape key we drop on the Target so a
+# file-mode Reference key can actually be previewed on the visible model.
+# Identified by prefix so it's always findable for cleanup.
+_SKP_PREVIEW_PREFIX = "[SKP Preview]"
+
 
 # -----------------------------------------
 #  External-file Reference: load / purge
@@ -66,6 +71,11 @@ def _skp_purge_temp_reference(context=None):
         if ref is not None and ref.get(_SKP_TEMP_REF_TAG):
             props.sync_reference = None
 
+    # Any temporary preview keys we dropped on a Target only make sense while a
+    # file-mode Reference is loaded, so tear them down here too. This is what
+    # keeps the preview key out of the user's saved file (save_pre -> purge).
+    _skp_clear_all_previews()
+
     removed = 0
     for obj in list(bpy.data.objects):
         if not obj.get(_SKP_TEMP_REF_TAG):
@@ -78,6 +88,77 @@ def _skp_purge_temp_reference(context=None):
         if mesh is not None and mesh.users == 0:
             bpy.data.meshes.remove(mesh)
     return removed
+
+
+def _skp_clear_all_previews():
+    """Remove every temporary preview shape key (by name prefix) from all mesh
+    objects. Returns the number removed. Cheap no-op when none exist."""
+    removed = 0
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH' or obj.data is None or obj.data.shape_keys is None:
+            continue
+        stale = [kb.name for kb in obj.data.shape_keys.key_blocks
+                 if kb.name.startswith(_SKP_PREVIEW_PREFIX)]
+        for nm in stale:
+            kb = obj.data.shape_keys.key_blocks.get(nm)
+            if kb is not None:
+                obj.shape_key_remove(kb)
+                removed += 1
+    return removed
+
+
+def _skp_preview_on_target(reference, target, name, value, auto_reset):
+    """Copy Reference key `name` onto `target` as a single throwaway preview
+    key driven to `value`, so a file-loaded (invisible) Reference can be seen
+    on the actual model. Replaces any prior preview key. With auto_reset, the
+    target's own keys are zeroed first. Returns (ok, msg)."""
+    if reference is None or reference.data is None or reference.data.shape_keys is None:
+        return False, "Reference has no shape keys."
+    if target is None or target.data is None:
+        return False, "Pick a Target mesh to preview onto."
+    ref_sk = reference.data.shape_keys
+    if name not in ref_sk.key_blocks:
+        return False, f"'{name}' not found on Reference."
+    ref_kb = ref_sk.key_blocks[name]
+    ref_basis = ref_sk.reference_key
+    if ref_basis is None:
+        return False, "Reference has no Basis."
+
+    if target.data.shape_keys is None:
+        target.shape_key_add(name="Basis", from_mix=False)
+    tgt_sk = target.data.shape_keys
+    tgt_basis = tgt_sk.reference_key
+    if tgt_basis is None:
+        return False, "Target has no Basis."
+
+    n = len(ref_kb.data)
+    if len(ref_basis.data) != n or len(tgt_basis.data) != n:
+        return False, "Vertex counts differ - can't preview on this Target."
+
+    # Drop any existing preview key anywhere, then optionally zero the target's
+    # own sliders so the preview is seen in isolation.
+    _skp_clear_all_previews()
+    if auto_reset:
+        basis_name = tgt_basis.name
+        for kb in tgt_sk.key_blocks:
+            if kb.name != basis_name and not is_category_divider(kb.name):
+                kb.value = 0.0
+
+    prev_kb = target.shape_key_add(name=f"{_SKP_PREVIEW_PREFIX} {name}",
+                                   from_mix=False)
+    ref_co = np.empty(n * 3, dtype=np.float32)
+    ref_basis_co = np.empty(n * 3, dtype=np.float32)
+    tgt_basis_co = np.empty(n * 3, dtype=np.float32)
+    ref_kb.data.foreach_get('co', ref_co)
+    ref_basis.data.foreach_get('co', ref_basis_co)
+    tgt_basis.data.foreach_get('co', tgt_basis_co)
+    prev_kb.data.foreach_set('co', tgt_basis_co + (ref_co - ref_basis_co))
+
+    prev_kb.slider_min = min(0.0, value)
+    prev_kb.slider_max = max(1.0, value)
+    prev_kb.value = value
+    target.active_shape_key_index = tgt_sk.key_blocks.find(prev_kb.name)
+    return True, ""
 
 
 def _skp_load_temp_reference(props):
@@ -368,6 +449,7 @@ def _sync_collect_extras(reference, target):
         kb.name for kb in sk.key_blocks
         if kb.name != basis_name
         and not is_category_divider(kb.name)
+        and not kb.name.startswith(_SKP_PREVIEW_PREFIX)
         and kb.name not in ref_names
     ]
 
@@ -972,9 +1054,11 @@ class SKP_OT_SyncCopyFiltered(_CooldownMixin, Operator):
 
 
 class SKP_OT_SyncPreviewKey(Operator):
-    """Drive a shape key slider on the Reference mesh to the preview value.
-    Respects Auto Reset and Preview Value from the Manager panel's preview
-    settings. Does NOT change which object is active."""
+    """Preview a Reference shape key. In scene mode this drives the slider on
+    the Reference mesh itself. In 'From .blend file' mode the Reference is
+    invisible, so the key is temporarily copied onto the Target so you can see
+    it on your model (removed automatically on Reset / Release / save).
+    Respects Auto Reset and Preview Value; shift-click keeps other sliders."""
     bl_idname = "skp.sync_preview_key"
     bl_label = "Preview Reference Shape Key"
     bl_options = {'REGISTER', 'UNDO'}
@@ -995,11 +1079,26 @@ class SKP_OT_SyncPreviewKey(Operator):
         if is_category_divider(self.key_name):
             self.report({'WARNING'}, "Cannot preview a category divider.")
             return {'CANCELLED'}
+
+        auto_reset = props.auto_reset and not self.extend
+
+        # File-mode Reference is off-screen; preview onto the Target instead.
+        if props.sync_reference_mode == 'FILE':
+            if context.mode != 'OBJECT':
+                self.report({'WARNING'},
+                            "Switch to Object Mode to preview on the Target.")
+                return {'CANCELLED'}
+            ok, msg = _skp_preview_on_target(
+                reference, props.sync_target, self.key_name,
+                props.preview_value, auto_reset,
+            )
+            if not ok:
+                self.report({'WARNING'}, msg)
+                return {'CANCELLED'}
+            return {'FINISHED'}
+
         ok = _sync_preview_one(
-            reference,
-            self.key_name,
-            props.preview_value,
-            auto_reset=props.auto_reset and not self.extend,
+            reference, self.key_name, props.preview_value, auto_reset,
         )
         if not ok:
             self.report({'WARNING'},
@@ -1009,23 +1108,37 @@ class SKP_OT_SyncPreviewKey(Operator):
 
 
 class SKP_OT_SyncResetReference(Operator):
-    """Reset every shape key on the Reference mesh to 0 (except Basis and
-    category dividers)."""
+    """Reset preview sliders to 0. Removes the temporary preview key from the
+    Target (file mode) and zeroes the Reference / Target sliders (except Basis
+    and category dividers)."""
     bl_idname = "skp.sync_reset_reference"
-    bl_label = "Reset Reference Sliders"
+    bl_label = "Reset Preview"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        reference = context.scene.skp_props.sync_reference
-        if reference is None or reference.data is None or reference.data.shape_keys is None:
-            self.report({'WARNING'}, "Reference has no shape keys.")
+        props = context.scene.skp_props
+
+        # Tear down any temporary on-Target preview key first.
+        cleared = _skp_clear_all_previews()
+
+        def _zero(obj):
+            if obj is None or obj.data is None or obj.data.shape_keys is None:
+                return
+            sk = obj.data.shape_keys
+            basis_name = sk.reference_key.name if sk.reference_key else "Basis"
+            for kb in sk.key_blocks:
+                if kb.name != basis_name and not is_category_divider(kb.name):
+                    kb.value = 0.0
+
+        reference = props.sync_reference
+        _zero(reference)
+        if props.sync_reference_mode == 'FILE':
+            _zero(props.sync_target)
+
+        if reference is None and not cleared:
+            self.report({'WARNING'}, "Nothing to reset.")
             return {'CANCELLED'}
-        sk = reference.data.shape_keys
-        basis_name = sk.reference_key.name if sk.reference_key else "Basis"
-        for kb in sk.key_blocks:
-            if kb.name != basis_name and not is_category_divider(kb.name):
-                kb.value = 0.0
-        self.report({'INFO'}, f"Reset all sliders on '{reference.name}'.")
+        self.report({'INFO'}, "Reset preview.")
         return {'FINISHED'}
 
 
@@ -1376,6 +1489,14 @@ class SKP_PT_SyncPanel(Panel):
         layout.separator(factor=0.4)
         layout.label(text="Browse Reference & Copy", icon='IMPORT')
 
+        if props.sync_reference_mode == 'FILE':
+            hint = layout.row()
+            hint.enabled = False
+            hint.label(
+                text="Preview (▶) shows the key on your Target temporarily.",
+                icon='HIDE_OFF',
+            )
+
         ref_cache = _get_cache(reference)
         ref_has_categories = bool(ref_cache and ref_cache.get('has_categories'))
 
@@ -1496,7 +1617,15 @@ class SKP_PT_SyncPanel(Panel):
                 name_col.label(text=kb.name, icon='SHAPEKEY_DATA')
 
                 if not is_category_divider(kb.name):
-                    prev_op = row.operator("skp.sync_preview_key", text="", icon='PLAY')
+                    # File-mode preview copies onto the Target, so it needs a
+                    # matching vertex count just like Copy does.
+                    prev_btn = row.row()
+                    prev_btn.enabled = (
+                        props.sync_reference_mode != 'FILE' or vcount_ok
+                    )
+                    prev_op = prev_btn.operator(
+                        "skp.sync_preview_key", text="", icon='PLAY',
+                    )
                     prev_op.key_name = kb.name
 
                     copy_btn = row.row()
@@ -1510,7 +1639,7 @@ class SKP_PT_SyncPanel(Panel):
         layout.separator(factor=0.4)
         action_row = layout.row(align=True)
         action_row.operator(
-            "skp.sync_reset_reference", text="Reset Reference", icon='LOOP_BACK',
+            "skp.sync_reset_reference", text="Reset Preview", icon='LOOP_BACK',
         )
 
         cf_col = action_row.column(align=True)

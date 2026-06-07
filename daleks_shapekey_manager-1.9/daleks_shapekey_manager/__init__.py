@@ -18,7 +18,7 @@ divider is detected, letting you filter the list to a single category.
 # on every release. Blender 4.2+ extensions may strip bl_info from the
 # runtime module namespace, so other code paths (e.g. the debug dump)
 # read _ADDON_VERSION directly.
-_ADDON_VERSION = (1, 10, 2)
+_ADDON_VERSION = (1, 10, 3)
 
 bl_info = {
     "name": "Dalek's Shapekey Manager",
