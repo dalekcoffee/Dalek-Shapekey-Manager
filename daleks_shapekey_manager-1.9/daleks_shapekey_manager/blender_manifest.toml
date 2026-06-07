@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "daleks_shapekey_manager"
-version = "1.8.4"
+version = "1.9.0"
 name = "Dalek's Shapekey Manager"
 tagline = "Preview, filter, manage and audit large numbers of shape keys"
 maintainer = "Dalek <https://dalek.coffee>"
